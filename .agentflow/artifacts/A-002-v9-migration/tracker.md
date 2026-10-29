@@ -10,7 +10,7 @@
 
 - **Last update:** 2026-10-29 23:20:30 +0800.
 
-- **Evidence commit:** f16370e.
+- **Evidence commit:** f16370e23b37279a18503377e7505f08862d2005.
 
 ## Overall state
 
@@ -58,7 +58,7 @@
 
 - **Next action remaining:** none.
 
-- **Evidence status:** current.
+- **Evidence status:** complete.
 
 - **Judgment:** complete.
 
