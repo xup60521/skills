@@ -113,4 +113,13 @@ Streams: none.
 
 # → Ask / A-002 (zup-swift-book)
 
-+
++ Upstream v9.1 replaces much of v8, including its hook-enforced closeout. Which sync direction do you want for your personal fork?
+  Migrate to v9 while preserving my custom features
+
+---
+
+## [RUN-001] Event — 2026-10-29 19:50:42 +0800 (A-002)
+
+- Owner selected v9 migration preserving personal features; nothing is authorized for publication to agfnow. [Design and requirements/specification](artifacts/A-002-v9-migration/design.md); [tracker](artifacts/A-002-v9-migration/tracker.md).
+- Existing-repository discovery/codewalk: pinned upstream 6c3537debc38e207da24ab6f25dcacbe98051541; independent native inventory is inspecting the 45-path local v8 delta. Host retains design, implementation and integration to avoid coupled edits while replacing the active runtime.
+- Consequential migration route: requirements/specification recorded before source; away-gates is on. Preserve custom outcomes using v9 mechanisms, not obsolete v8 APIs. Snapshot /tmp/agentflow-migration-17w84_uf/v8 retains this round's current bookkeeping runtime.
