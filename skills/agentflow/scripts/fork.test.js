@@ -68,15 +68,22 @@ test('OpenCode worker keeps model, arbitrary variant and complete Unicode stdin 
   assert.equal(observed.permission.edit, undefined)
   assert.equal(observed.permission['*'], 'deny')
   assert.equal(observed.permission.read, 'allow')
+  assert.equal(observed.permission.list, 'allow')
+  assert.equal(observed.permission.external_directory, undefined)
+  await A.launch_agent({ selection, role: 'task', cwd: root, prompt: 'task', attempt, attempt_dir: path.join(root, 'task-attempt') })
+  const skill = path.resolve(__dirname, '..').split(path.sep).join('/')
+  assert.deepEqual(JSON.parse(fs.readFileSync(capture)).permission.external_directory, { [skill + '/**']: 'allow' })
 })
 
-test('OpenCode result parsing rejects failed, stale, multiple or malformed final responses', () => {
+test('OpenCode result parsing takes the final text part and rejects failed, stale, missing or malformed results', () => {
   const attempt = { id: 'expected' }
   const event = value => JSON.stringify({ type: 'text', part: { text: value } })
   const result = JSON.stringify({ attempt_id: 'expected', outcome: 'pass', summary: 'ok', evidence: [] })
   assert.equal(A.parse_opencode_result(event(result), attempt).outcome, 'pass')
   assert.throws(() => A.parse_opencode_result(event(result.replace('expected', 'stale')), attempt), /stale/)
-  assert.throws(() => A.parse_opencode_result(event(result) + '\n' + event(result), attempt), /ambiguous/)
+  assert.equal(A.parse_opencode_result(['provider log line on stderr', event('Reading the plan first.'), event(result)].join('\n'), attempt).outcome, 'pass')
+  assert.throws(() => A.parse_opencode_result(event(result) + '\n' + event('Done.'), attempt), /JSON/)
+  assert.throws(() => A.parse_opencode_result('only stderr noise', attempt), /missing/)
   assert.throws(() => A.parse_opencode_result(event(result) + '\n' + JSON.stringify({ type: 'error', error: { message: 'failed' } }), attempt), /failed/)
   assert.throws(() => A.parse_opencode_result(event('not JSON'), attempt), /JSON|malformed/)
 })

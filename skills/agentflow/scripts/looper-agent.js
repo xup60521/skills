@@ -127,7 +127,11 @@ function parse_windows_snapshot(output) {
   })
 }
 
-function observe_descendants(root_pid, tracked, root_started_at, { platform = process.platform, snapshot, identify = process_identity, alive = process_alive, root_stopped = false } = {}) {
+const process_exited = pid => {
+  try { process.kill(pid, 0); return false } catch (error) { return error.code === 'ESRCH' }
+}
+
+function observe_descendants(root_pid, tracked, root_started_at, { platform = process.platform, snapshot, identify = process_identity, alive = process_alive, exited = process_exited, root_stopped = false } = {}) {
   let rows
   try {
     if (platform === 'win32') {
@@ -156,7 +160,7 @@ function observe_descendants(root_pid, tracked, root_started_at, { platform = pr
     if (platform === 'linux' && !row.started_at) row.started_at = identify(pid)
     // A short-lived process can exit between the ps snapshot and its /proc read.
     // Only a proved exit is absent; any other missing identity stays uncertain.
-    if (platform === 'linux' && !row.started_at && alive({ pid, started_at: 'exited' }) === false) {
+    if (platform === 'linux' && !row.started_at && exited(pid)) {
       live.delete(pid)
       return null
     }
@@ -457,7 +461,7 @@ async function run_checks({
   return results
 }
 
-module.exports = { resolve_command, shim_entry, npm_shim, parse_windows_snapshot, observe_descendants, signal_descendants, execute, run_checks, descendant_recorder, safe_directory }
+module.exports = { resolve_command, shim_entry, npm_shim, parse_windows_snapshot, observe_descendants, process_exited, signal_descendants, execute, run_checks, descendant_recorder, safe_directory }
 
 const result_schema = (attempt) => ({
   type: 'object', additionalProperties: false,
@@ -570,7 +574,9 @@ async function launch_agent({ selection, role, cwd, prompt, attempt, attempt_dir
     args = ['run', '--model', selection.model, ...(selection.effort === 'default' ? [] : ['--variant', selection.effort]), '--format', 'json']
     const inherited = JSON.parse(process.env.OPENCODE_CONFIG_CONTENT || '{}')
     if (!inherited || typeof inherited !== 'object' || Array.isArray(inherited)) throw Error('OPENCODE_CONFIG_CONTENT must be an object')
-    const permission = { '*': 'deny', read: 'allow', glob: 'allow', grep: 'allow',
+    const permission = { '*': 'deny', read: 'allow', glob: 'allow', grep: 'allow', list: 'allow',
+      // Tasks load SKILL.md from outside the worktree, like Claude/Copilot --add-dir.
+      ...(task ? { external_directory: { [path.resolve(__dirname, '..').split(path.sep).join('/') + '/**']: 'allow' } } : {}),
       ...(editing ? { edit: 'allow', bash: 'allow', skill: 'allow' } : {}),
       ...(process.env.CODEX_SANDBOX_NETWORK_DISABLED === '1' ? {} : { webfetch: 'allow', websearch: 'allow' }) }
     opencode_env = { ...process.env, OPENCODE_CONFIG_CONTENT: JSON.stringify({ ...inherited, permission }),
@@ -636,11 +642,15 @@ function parse_claude_result(source) {
   return finals[0].structured_output
 }
 function parse_opencode_result(source, attempt) {
-  const events = source.replace(/^\uFEFF/, '').split(/\r?\n/).filter(line => line.trim()).map(line => JSON.parse(line))
+  // The transcript also holds stderr, so skip non-event lines. Earlier text parts are
+  // narration between tool calls; the final text part must be the attempt result.
+  const events = source.replace(/^\uFEFF/, '').split(/\r?\n/).flatMap(line => {
+    try { const event = JSON.parse(line); return event && typeof event === 'object' ? [event] : [] } catch { return [] }
+  })
   if (events.some(event => event.type === 'error')) throw Error('OpenCode result failed')
-  const messages = events.filter(event => event.type === 'text').map(event => event.part?.text)
-  if (messages.length !== 1 || typeof messages[0] !== 'string') throw Error('OpenCode result missing or ambiguous')
-  return validate_result(JSON.parse(messages[0]), attempt)
+  const message = events.filter(event => event.type === 'text').at(-1)?.part?.text
+  if (typeof message !== 'string') throw Error('OpenCode result missing')
+  return validate_result(JSON.parse(message), attempt)
 }
 Object.assign(module.exports, { launch_agent, validate_result, result_schema, parse_claude_result, parse_opencode_result, provider_error, diagnostic_text })
 

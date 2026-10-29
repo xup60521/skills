@@ -144,3 +144,11 @@ Streams: none.
 - **Still to do:** Complete packaged suite, real PTY journey, independent exact-source review, safe local-hook retirement and personal-only delivery.
 - **Next work action:** Finish scoped documentation/test updates and run npm test from skills/agentflow.
 - **Checks:** [x] tracker.md | [x] devlog RUN | [x] scope matches tracker
+
+## [RUN-004] Event — 2026-10-29 20:33:46 +0800 (A-002)
+
+- Stock v9 test "exact interrupted worktree" depended on macOS /usr/bin/trash and failed on Linux; it now moves the notebook aside portably. Upstream's real-terminal, merge/cleanup journey and --open tests were macOS-gated; they now run and pass on Linux (zsh cases skip without zsh).
+- Upstream Linux race: a short-lived descendant listed by ps but gone before its /proc read made checks "Process identity uncertain" intermittently. Now a proved exit (ESRCH) is absent; any other missing identity stays uncertain.
+- Retired v8 machine-local hooks pointing at deleted scripts: .codex/hooks.json (Stop/UserPromptSubmit) and .git/hooks/pre-commit (devlog-guard), both moved to freedesktop Trash.
+- Independent review of the exact personal patch (c3140a8) found 4 confirmed and 4 plausible defects. Fixed with red-first tests: env links blocked clean cleanup/drop; cross-volume recovery failed after mutation (now refused before any change); orphan .trashinfo blocked retries; the exited-process rule could drop a live process; OpenCode result parsing too strict; OpenCode tasks could not read SKILL.md; tmpfs shell channel stack trace; duplicated docs text. Windows cross-drive refusal kept by policy and documented.
+- Full suite: 317 tests, 307 pass, 0 fail, 10 skips (native macOS Trash, zsh, platform-specific), twice consecutively. No live OpenCode provider or native Windows proof.

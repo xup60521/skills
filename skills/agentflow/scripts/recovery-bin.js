@@ -45,9 +45,15 @@ function recovery_bin({ home = os.homedir(), platform = process.platform, env = 
       fs.writeFileSync(fd, `[Trash Info]\nPath=${encodeURI(source).replace(/[?#]/g, encodeURIComponent)}\nDeletionDate=${stamp}\n`)
       fs.fsyncSync(fd)
     } finally { fs.closeSync(fd) }
-    const current = fs.lstatSync(source)
-    if (current.dev !== before.dev || current.ino !== before.ino) throw Error('Recovery source identity changed')
-    fs.renameSync(source, destination)
+    try {
+      const current = fs.lstatSync(source)
+      if (current.dev !== before.dev || current.ino !== before.ino) throw Error('Recovery source identity changed')
+      fs.renameSync(source, destination)
+    } catch (error) {
+      // Nothing moved; drop only this call's metadata so a retry can reuse the destination.
+      fs.unlinkSync(metadata)
+      throw error
+    }
     const moved = fs.lstatSync(destination)
     if (moved.dev !== before.dev || moved.ino !== before.ino || fs.existsSync(source)) throw Error('Recovery outcome uncertain; inspect retained paths')
     return destination

@@ -2803,16 +2803,17 @@ test('CLI grouped success reads summaries actually persisted by the coordinator'
 })
 
 test('Linux descendant listed by ps but exited before identity lookup is absent, not uncertain', { skip: process.platform !== 'linux' }, async t => {
-  const { observe_descendants } = require('./looper-agent')
+  const { observe_descendants, process_exited } = require('./looper-agent')
   const S = require('./looper-state')
   const child = require('node:child_process').spawn('sleep', ['30'], { stdio: 'ignore' })
   t.after(() => child.kill())
   await new Promise(resolve => child.once('spawn', resolve))
   const root = S.process_identity(process.pid)
-  // Simulate exit between the ps snapshot and the /proc read.
+  // Simulate a failed /proc read for the child; ps itself is a real short-lived child.
   const identify = pid => pid === child.pid ? null : S.process_identity(pid)
-  const scan = alive => observe_descendants(process.pid, new Map(), root, { identify, alive })
-  assert.equal(scan(item => item.pid === child.pid ? false : S.process_alive(item)).some(row => row.pid === child.pid), false)
-  assert.throws(() => scan(item => item.pid === child.pid || S.process_alive(item)), error => error.unsettled === true)
-  assert.throws(() => scan(item => item.pid === child.pid ? 'unknown' : S.process_alive(item)), error => error.unsettled === true)
+  const scan = gone => observe_descendants(process.pid, new Map(), root, { identify, exited: pid => pid === child.pid ? gone : process_exited(pid) })
+  assert.equal(scan(true).some(row => row.pid === child.pid), false)
+  // A live process whose /proc read failed is never assumed gone.
+  assert.equal(process_exited(child.pid), false)
+  assert.throws(() => scan(false), error => error.unsettled === true)
 })

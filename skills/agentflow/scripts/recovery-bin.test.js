@@ -38,3 +38,18 @@ test('Windows recovery uses a retained private directory rather than permanent d
   assert.equal(fs.readFileSync(moved, 'utf8'), 'owner')
   assert.equal(fs.existsSync(file), false)
 })
+
+test('a failed move leaves no metadata, so a retry to the same destination succeeds', t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'agf-recovery-')))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const { recovery_bin } = require('./recovery-bin')
+  const bin = recovery_bin({ home: root, platform: 'linux', env: {} })
+  const source = path.join(root, 'busy'), destination = path.join(bin.root, 'busy-kept')
+  fs.mkdirSync(source)
+  const rename = fs.renameSync
+  fs.renameSync = () => { throw Object.assign(Error('busy'), { code: 'EBUSY' }) }
+  try { assert.throws(() => bin.move(source, { destination }), /busy/) } finally { fs.renameSync = rename }
+  assert.ok(fs.existsSync(source))
+  assert.equal(fs.existsSync(path.join(bin.info, 'busy-kept.trashinfo')), false)
+  assert.equal(bin.move(source, { destination }), destination)
+})

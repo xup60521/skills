@@ -94,9 +94,10 @@ function supportedRecordLocale(settings) {
   const locale = settings['use-lang'] || Intl.DateTimeFormat().resolvedOptions().locale
   insist(require('./looper-report').supported_locale(locale), `Unsupported record locale ${locale}; no feature records were written. Continue with a host that can render the configured language; do not persist an English fallback.`)
 }
-function preflightClaimDisposal() {
+// Claims live beside the checkout, so prove same-volume recovery before any mutation.
+function preflightClaimDisposal(source) {
   insist(['darwin', 'win32', 'linux'].includes(process.platform), 'Recoverable feature disposal unsupported on this platform')
-  if (process.platform !== 'darwin') require('./recovery-bin').recovery_bin().prepare()
+  if (process.platform !== 'darwin') require('./recovery-bin').recovery_bin().prepare(source)
   if (process.platform === 'darwin') {
     S.checked_file('/usr/bin/trash')
     fs.accessSync('/usr/bin/trash', fs.constants.X_OK)
@@ -108,8 +109,8 @@ function preflightClaimDisposal() {
   }
 }
 function preflightTrash(target) {
-  preflightClaimDisposal()
-  if (process.platform !== 'darwin') return void require('./recovery-bin').recovery_bin().prepare(target)
+  preflightClaimDisposal(target)
+  if (process.platform !== 'darwin') return
   const root = path.join(os.homedir(), '.Trash')
   insist(fs.statSync(root).dev === fs.statSync(target).dev, 'Same-volume recoverable Trash required before retirement writes')
   insist(target !== root && !target.startsWith(root + path.sep) && !root.startsWith(target + path.sep), 'Unsafe Trash/feature location')
@@ -168,7 +169,7 @@ function context(cwd = process.cwd(), name, verb = 'new-feature') {
   let config = discover(exists(target) ? target : main, { allowAbsent: exists(target) })
   if (config.absent) config = inheritedConfig(main, target)
   supportedRecordLocale(config.settings)
-  preflightClaimDisposal()
+  preflightClaimDisposal(main)
   const relativeNotebook = `${config.agDir}/features/${name}/${name}.devlog.md`
   let mainTipResult = git(main, ['rev-parse', '--verify', 'HEAD'], { allowFailure: true })
   if (mainTipResult.status !== 0) {
@@ -264,15 +265,27 @@ function treeDigest(root) {
   visit(root, '')
   return hash.digest('hex')
 }
+// Feature creation links main's .env.local/.env.production; only that exact link is disposable.
+function envLink(c, name) {
+  if (!['.env.local', '.env.production'].includes(path.posix.basename(name))) return false
+  const source = path.join(c.main, ...name.split('/')), target = path.join(c.target, ...name.split('/'))
+  try {
+    const link = fs.lstatSync(target)
+    if (link.isSymbolicLink()) return fs.readlinkSync(target) === source
+    const main = fs.lstatSync(source)
+    return link.isFile() && main.isFile() && link.nlink > 1 && link.dev === main.dev && link.ino === main.ino
+  } catch { return false }
+}
 function cleanFeature(c, allowedPaths = []) {
   const raw = git(c.target, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=matching'])
-  const entries = raw.split('\0').filter(Boolean), changed = []
+  const entries = raw.split('\0').filter(Boolean), changed = [], ignored = new Set()
   for (let i = 0; i < entries.length; i++) {
     const entry = entries[i]; changed.push(entry.slice(3))
+    if (entry.startsWith('!! ')) ignored.add(entry.slice(3))
     if (/[RC]/.test(entry.slice(0, 2))) changed.push(entries[++i])
   }
   const config = localLifecycleConfig(c)
-  const allowed = name => name === config || allowedPaths.some(rule => rule.endsWith('/') ? name.startsWith(rule) : name === rule)
+  const allowed = name => name === config || (ignored.has(name) && envLink(c, name)) || allowedPaths.some(rule => rule.endsWith('/') ? name.startsWith(rule) : name === rule)
   insist(changed.every(allowed), `Feature has tracked, untracked or ignored data: ${changed.filter(p => !allowed(p)).join(', ')}; use --abandon to abandon it`)
 }
 function retire(c, { abandon = false, expectedTip = c.featureTip, allowedPaths = [] } = {}) {

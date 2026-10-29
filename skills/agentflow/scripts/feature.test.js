@@ -372,6 +372,43 @@ test('clean default drop preserves main private config while allowing its duplic
   assert.ok(index.includes('.agentflow/ag.json'))
 })
 
+test('clean drop disposes only the feature env links and keeps main env files', async t => {
+  const root = fixture(t)
+  fs.mkdirSync(path.join(root, 'app'))
+  fs.writeFileSync(path.join(root, '.gitignore'), '.env.local\n'); C.git(root, ['add', '.gitignore']); C.git(root, ['commit', '-m', 'ignore env'])
+  for (const file of ['.env.local', 'app/.env.local']) fs.writeFileSync(path.join(root, file), `SECRET=${file}\n`)
+  await F.create('envs', { cwd: root })
+  const c = C.context(root, 'envs')
+  assert.equal(fs.readlinkSync(path.join(c.target, 'app/.env.local')), path.join(root, 'app/.env.local'))
+  C.git(c.target, ['add', '--', c.relativeNotebook]); C.git(c.target, ['commit', '-m', 'prepared record only'])
+  C.git(root, ['merge', '--ff-only', c.branch])
+  await F.drop('envs', { cwd: root })
+  assert.equal(fs.existsSync(c.target), false)
+  for (const file of ['.env.local', 'app/.env.local']) assert.equal(fs.readFileSync(path.join(root, file), 'utf8'), `SECRET=${file}\n`)
+})
+
+test('clean drop still refuses an env file that is not the created link', async t => {
+  const root = fixture(t)
+  fs.writeFileSync(path.join(root, '.gitignore'), '.env.local\n'); C.git(root, ['add', '.gitignore']); C.git(root, ['commit', '-m', 'ignore env'])
+  await F.create('own-env', { cwd: root })
+  const c = C.context(root, 'own-env')
+  fs.writeFileSync(path.join(c.target, '.env.local'), 'FEATURE_ONLY=1\n')
+  C.git(c.target, ['add', '--', c.relativeNotebook]); C.git(c.target, ['commit', '-m', 'prepared record only'])
+  C.git(root, ['merge', '--ff-only', c.branch])
+  await assert.rejects(F.drop('own-env', { cwd: root }), /ignored data: \.env\.local/)
+  assert.equal(fs.readFileSync(path.join(c.target, '.env.local'), 'utf8'), 'FEATURE_ONLY=1\n')
+})
+
+test('Linux creation refuses before any mutation when recovery storage is on another volume', { skip: process.platform !== 'linux' || !fs.existsSync('/dev/shm') }, async t => {
+  const root = fixture(t), data = fs.mkdtempSync('/dev/shm/agf-recovery-'), old = process.env.XDG_DATA_HOME
+  if (fs.statSync(data).dev === fs.statSync(root).dev) return t.skip('needs a second volume')
+  process.env.XDG_DATA_HOME = data
+  t.after(() => { if (old === undefined) delete process.env.XDG_DATA_HOME; else process.env.XDG_DATA_HOME = old; fs.rmSync(data, { recursive: true, force: true }) })
+  await assert.rejects(F.create('far', { cwd: root }), /Same-volume recovery required/)
+  assert.equal(C.git(root, ['rev-parse', '--verify', 'feature/far'], { allowFailure: true }).status, 128)
+  assert.equal(fs.existsSync(path.join(root, '.wts')), false)
+})
+
 test('custom config paths produce literal owner-marker ignore rules', async t => {
   const root = fixture(t, { agDir: 'records[private]' })
   const result = await F.create('literal', { cwd: root })

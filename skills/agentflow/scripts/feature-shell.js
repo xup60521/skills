@@ -69,7 +69,7 @@ function binding(shell, launcher = path.resolve(__dirname, 'agf.js')) {
   if command -v trash >/dev/null 2>&1; then
     command trash "$agf_cd_file" >/dev/null || printf '%s\\n' "agf: retained temporary channel $agf_cd_file" >&2
   else
-    node -e 'require(process.argv[1]).recovery_bin().move(process.argv[2])' ${quote(path.join(path.dirname(launcher), 'recovery-bin.js'))} "$agf_cd_file" >/dev/null || printf '%s\\n' "agf: retained temporary channel $agf_cd_file (recovery unavailable)" >&2
+    node -e 'require(process.argv[1]).recovery_bin().move(process.argv[2])' ${quote(path.join(path.dirname(launcher), 'recovery-bin.js'))} "$agf_cd_file" >/dev/null 2>&1 || printf '%s\\n' "agf: retained temporary channel $agf_cd_file (recovery unavailable)" >&2
   fi
   return "$agf_exit"
 }
