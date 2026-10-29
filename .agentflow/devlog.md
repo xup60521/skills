@@ -123,3 +123,24 @@ Streams: none.
 - Owner selected v9 migration preserving personal features; nothing is authorized for publication to agfnow. [Design and requirements/specification](artifacts/A-002-v9-migration/design.md); [tracker](artifacts/A-002-v9-migration/tracker.md).
 - Existing-repository discovery/codewalk: pinned upstream 6c3537debc38e207da24ab6f25dcacbe98051541; independent native inventory is inspecting the 45-path local v8 delta. Host retains design, implementation and integration to avoid coupled edits while replacing the active runtime.
 - Consequential migration route: requirements/specification recorded before source; away-gates is on. Preserve custom outcomes using v9 mechanisms, not obsolete v8 APIs. Snapshot /tmp/agentflow-migration-17w84_uf/v8 retains this round's current bookkeeping runtime.
+
+## [RUN-002] Event — 2026-10-29 19:51:53 +0800 (A-002)
+
+- Independent inventory completed: all 20 changed production JavaScript files, seven documentation files and 18 test files inspected. Confirmed missing T3/OpenCode/environment-link ports and local-Claude-hook inventory.
+- Design Go under configured away-gates: on, for committed contract ca856d5 after independent inventory corroboration. Imported pinned v9 skill and retained its license/changelog within the self-contained skill. Requirements/specification are the R/INV/AC contract in design.md; no new owner-only policy choice is assumed.
+- Upstream Windows feature cleanup permanently deletes its worktree, contrary to the retained recoverability requirement. Porting portable recoverable disposal will replace that behavior, and will retain Linux feature support rather than import upstream's Linux refusal.
+
+## [RUN-003] Event — 2026-10-29 19:58:35 +0800 (A-002)
+
+- Six regression checks first failed against stock v9, then passed after OpenCode model/variant and attempt-result ports, environment links with hard-link fallback, and recoverable Linux/Windows moves.
+- Scope comparison: changes remain inside skills/agentflow, README.md and current A-002 records. Unrelated skills, original v8 changelog, root license and owner rules remain unchanged. V8 project configuration/history is still retained for this open round.
+- Portable disposal choice preserves recoverable bytes and rejects permanent deletion. Linux uses freedesktop Trash; Windows uses an explicitly documented private .agentflow-recovery store, not an unproved desktop Recycle Bin API. No native Windows proof is claimed.
+- OpenCode 1.19.4 is installed; its actual run help confirms model, variant, JSON-format and pure controls. No paid provider session has run. Static T3 and local-Claude-hook migration ports are in place; documentation alignment and full suite/terminal/review evidence remain.
+
+## [WIP-001] Checkpoint — 2026-10-29 19:58:36 +0800 (A-002)
+
+- **Finished:** Pinned v9 import, independent custom inventory, plan/contract commit, core OpenCode/environment/recovery ports and first six green regressions.
+- **Running now:** Host is aligning documentation and adding integration coverage; no external mutating process is running.
+- **Still to do:** Complete packaged suite, real PTY journey, independent exact-source review, safe local-hook retirement and personal-only delivery.
+- **Next work action:** Finish scoped documentation/test updates and run npm test from skills/agentflow.
+- **Checks:** [x] tracker.md | [x] devlog RUN | [x] scope matches tracker

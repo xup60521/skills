@@ -31,4 +31,4 @@ bunx skills add xup60521/skills --skill agentflow
 
 `html-summary` was imported from the local global skill.
 
-AgentFlow is my fork of [agfnow/agentflow](https://github.com/agfnow/agentflow). I needed Windows support, so I decided to maintain my own version. It was imported into this collection from [xup60521/agentflow](https://github.com/xup60521/agentflow). Its Apache-2.0 license is retained in [LICENSE](LICENSE), and the imported release history is in [docs/agentflow-changelog.md](docs/agentflow-changelog.md).
+AgentFlow is my fork of [agfnow/agentflow](https://github.com/agfnow/agentflow). I needed Windows support, so I decided to maintain my own version. It was imported into this collection from [xup60521/agentflow](https://github.com/xup60521/agentflow). It now uses upstream v9.1.0 with the personal Windows, OpenCode, T3 and environment-link ports described in [the fork notes](skills/agentflow/FORK.md). The self-contained skill includes its [Apache-2.0 license](skills/agentflow/LICENSE) and [v9 release history](skills/agentflow/CHANGELOG.md). The original v8 history remains in [docs/agentflow-changelog.md](docs/agentflow-changelog.md).

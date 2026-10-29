@@ -1,3106 +1,2818 @@
 'use strict'
 
+const test = require('node:test')
 const assert = require('node:assert/strict')
-const crypto = require('node:crypto')
-const { EventEmitter } = require('node:events')
 const fs = require('node:fs')
+const current_schema = require('../assets/.agentflow/ag.json')['schema-version']
+const crypto = require('node:crypto')
 const os = require('node:os')
 const path = require('node:path')
-const { spawn } = require('node:child_process')
-const { PassThrough } = require('node:stream')
-const test = require('node:test')
+const { execFileSync } = require('node:child_process')
+const L = require('./looper')
+const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
+const read = root => JSON.parse(fs.readFileSync(path.join(root, 'queue.json')))
+const write = (root, q) => fs.writeFileSync(path.join(root, 'queue.json'), JSON.stringify(q))
+const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r }); return { promise, resolve } }
+const selection = { kind: 'cli', provider: 'codex', model: 'gpt-6.1-sol', effort: 'low' }
 
-const { HELP, notebook_round_state, parse_cli, queue_view, render_help, run_looper, workspace_defaults, write_all_sync } = require('./looper')
-const agentflow_settings = require('./ag-settings')
-const queue_contract = require('./queue-contract')
-const make_temp_directory = require('./fixtures/temp-directory')
-
-const completion_path = 'devlog.md'
-const completion_line = `${completion_path} updated`
-
-test('CLI defaults to the current planned directory and rejects malformed options', () => {
-	assert.deepEqual(parse_cli([]), workspace_defaults(process.cwd()))
-  assert.equal(parse_cli(['planned/custom']).tasks_dir, 'planned/custom')
-  assert.equal(parse_cli(['--show-output']).show_output, true)
-  assert.equal(parse_cli(['--reset']).reset, true)
-  assert.throws(() => parse_cli(['--tasks-dir']), /requires a value/i)
-  assert.throws(() => parse_cli(['--unknown']), /unknown option/i)
-  assert.throws(() => parse_cli(['one', 'two']), /one task directory/i)
-})
-
-test('help wraps descriptions to a narrow terminal width with hanging indentation', () => {
-  const rendered = render_help(40)
-  for (const line of rendered.split('\n')) {
-    const words = line.trim().split(/\s+/u)
-    assert.ok(line.length <= 40 || (words.length === 1 && words[0].length > 40), `${line.length}: ${line}`)
-  }
-  assert.match(rendered, /--completion-path <path>\n {4}Notebook/)
-  assert.match(rendered, /\n {4}updated" reply proves completion\./)
-  assert.match(rendered, /--reset/)
-  assert.match(rendered, /exit without running[\s\S]*plan/i)
-})
-
-test('the host instructions explain both looper queue types, progress, and hang recovery', () => {
-  const skill = fs.readFileSync(path.join(__dirname, '..', 'SKILL.md'), 'utf8')
-  const reference = fs.readFileSync(path.join(__dirname, '..', 'references', 'looper.md'), 'utf8')
-  assert.match(skill, /references\/looper\.md/)
-  assert.match(reference, /agf-looper/)
-  assert.match(reference, /handwritten/i)
-  assert.match(reference, /make-plans/i)
-  assert.match(reference, /progress/i)
-  assert.match(reference, /hang/i)
-  assert.match(reference, /--reset/)
-})
-
-test('notebook completion proof requires exact Reply and next empty Ask headings', () => {
-  assert.deepEqual(notebook_round_state('# ← Reply / A-001\n\n---\n\n# → Ask / A-002\n\n+\n'), {
-    reply_ids: [1],
-    next_ask_id: 2,
-  })
-  assert.deepEqual(notebook_round_state('## [FINAL REPORT]\n\nDone.\n\ndevlog.md updated\n'), {
-    reply_ids: [],
-    next_ask_id: 0,
-  })
-  assert.deepEqual(notebook_round_state('# ← Reply / A-001 (owner)\r\n\r\n---\r\n\r\n# → Ask / A-002 (owner)\r\n\r\n+\r\n'), {
-    reply_ids: [1],
-    next_ask_id: 2,
-  })
-})
-
-test('an old empty Ask cannot be reused as proof of a newly completed round', async () => {
-  const dir = make_temp_dir('agentflow-looper-reused-ask')
-  const queue = path.join(dir, 'planned')
-  try {
-    fs.mkdirSync(queue)
-    fs.mkdirSync(path.join(queue, 'done'))
-    fs.writeFileSync(path.join(dir, 'devlog.md'), '# → Ask / A-001\n\n+\n')
-    write_plan(queue, 'plan-001.md')
-    const fake_child = make_fake_child(dir)
-    const result = await run_looper(base_options(queue, fake_child, {}, {
-      root: dir,
-      verify_notebook_round: true,
-      spawn: () => {
-        fs.appendFileSync(path.join(dir, 'devlog.md'), '\n# ← Reply / A-001\n')
-        return spawn(process.execPath, [fake_child, JSON.stringify({ mode: 'success', marker: completion_line })], { stdio: ['ignore', 'pipe', 'pipe'] })
-      },
-    }))
-    assert.notEqual(result.code, 0)
-    assert.equal(fs.existsSync(path.join(queue, 'plan-001.md')), true)
-  } finally {
-    remove_temp_dir(dir)
-  }
-})
-
-test('Windows looper accepts ACL-based state and reaches worker launch', { skip: process.platform !== 'win32' ? 'Windows security boundary' : false }, async () => {
-  const dir = make_temp_dir('agentflow-looper-windows-acl')
-  const queue = path.join(dir, 'planned')
-  try {
-    fs.mkdirSync(queue)
-    fs.writeFileSync(path.join(dir, 'devlog.md'), '# → Ask / A-001\n\n+\n')
-    write_plan(queue, 'plan-001.md')
-    const fake_child = make_fake_child(dir)
-    let launched = false
-    const result = await run_looper(base_options(queue, fake_child, {}, {
-      root: dir,
-      spawn: () => { launched = true; throw Error('Windows launch boundary reached') },
-    }))
-    assert.notEqual(result.code, 0)
-    assert.match(result.message, /Windows launch boundary reached/)
-    assert.doesNotMatch(result.message, /permission bits/)
-    assert.equal(launched, true)
-    assert.equal(fs.existsSync(path.join(queue, 'plan-001.md')), true)
-  } finally { remove_temp_dir(dir) }
-})
-
-test('a completion signal cannot archive a plan without a new notebook round', async () => {
-  const dir = make_temp_dir('agentflow-looper-notebook-proof')
-  const queue = path.join(dir, 'planned')
-  try {
-    fs.mkdirSync(queue)
-    fs.mkdirSync(path.join(queue, 'done'))
-    fs.writeFileSync(path.join(dir, 'devlog.md'), '# → Ask / A-001\n\n+\n')
-    write_plan(queue, 'plan-001.md')
-    const fake_child = make_fake_child(dir)
-    const result = await run_looper(base_options(queue, fake_child, {}, {
-      root: dir,
-      verify_notebook_round: true,
-    }))
-    assert.notEqual(result.code, 0)
-    assert.match(result.message, /did not add exactly one.*Reply.*Ask/is)
-    assert.equal(fs.existsSync(path.join(queue, 'plan-001.md')), true)
-    assert.equal(fs.existsSync(path.join(queue, 'done', 'plan-001.md')), false)
-  } finally {
-    remove_temp_dir(dir)
-  }
-})
-
-const module_path = path.join(__dirname, 'looper.js')
-const test_state_root = make_temp_directory('.agentflow-looper-state-')
-
-process.once('exit', () => {
-  fs.rmSync(test_state_root, { recursive: true, force: true })
-})
-
-const fake_child_source = String.raw`'use strict'
-
-const fs = require('node:fs')
-const path = require('node:path')
-const { spawn } = require('node:child_process')
-
-const config = JSON.parse(process.argv[2])
-
-const append_json = (file, value) => {
-  if (!file) return
-  fs.appendFileSync(file, JSON.stringify(value) + '\n')
+// Fake ordinary task hosts render their own notebook before acting.
+const real_run = L.run
+L.run = async (root, options = {}) => {
+  if (!options.agent) return real_run(root, options)
+  const delegate = options.agent
+  return real_run(root, { ...options, agent: async args => {
+    if (args.role === 'task') render_notebook(args.cwd)
+    return delegate(args)
+  } })
+}
+function render_notebook(cwd) {
+  const file = path.join(cwd, '.aglite-records/devlog.md')
+  if (!fs.existsSync(file)) fs.writeFileSync(file, '# STATUS\n\n# → Ask / A-001\n')
 }
 
-const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+test('Codex CLI network inheritance preserves parent blocks and read-only scope', async () => {
+  const { launch_agent } = require('./looper-agent')
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'aglite-network-test-')))
+  const original = process.env.CODEX_SANDBOX_NETWORK_DISABLED
+  try {
+    for (const [role, blocked, network] of [
+      ['task', undefined, true], ['task', '1', false],
+      ['repair', undefined, true], ['review', undefined, false],
+      ['repair', '1', false], ['review', '1', false]
+    ]) {
+      if (blocked === undefined) delete process.env.CODEX_SANDBOX_NETWORK_DISABLED
+      else process.env.CODEX_SANDBOX_NETWORK_DISABLED = blocked
+      const attempt = { id: crypto.randomUUID() }
+      const attempt_dir = path.join(home, attempt.id)
+      // Node deliberately rejects Codex's argv; no provider call or credentials are needed.
+      await assert.rejects(launch_agent({ selection: { ...selection, executable: process.execPath },
+        role, cwd: home, prompt: 'Check only the assigned outcome.', attempt, attempt_dir }), /Worker failed/)
+      const { command } = JSON.parse(fs.readFileSync(path.join(attempt_dir, 'launch.json')))
+      assert.equal(command.includes('sandbox_workspace_write.network_access=true'), network)
+      assert.ok(command.includes(`web_search=${JSON.stringify(blocked === '1' ? 'disabled' : 'live')}`))
+      assert.equal(command[command.indexOf('-s') + 1], role === 'review' ? 'read-only' : 'workspace-write')
+      assert.equal(command.some(arg => arg.startsWith('--dangerously-')), false)
+    }
+  } finally {
+    if (original === undefined) delete process.env.CODEX_SANDBOX_NETWORK_DISABLED
+    else process.env.CODEX_SANDBOX_NETWORK_DISABLED = original
+  }
+})
 
-const write_chunks = async (stream, chunks) => {
-  for (const chunk of chunks) {
-    stream.write(chunk)
-    await wait(8)
+function symlink_or_skip(t, ...args) {
+  try { fs.symlinkSync(...args); return true }
+  catch (error) {
+    if (process.platform !== 'win32' || error.code !== 'EPERM' || args[2] === 'junction') throw error
+    t.skip('Windows symlink privilege unavailable (EPERM); link refusal remains unproved on this machine')
+    return false
   }
 }
 
-const output = async () => {
-  const marker = config.marker || 'devlog.md updated'
-  const stream = config.stream === 'stderr' ? process.stderr : process.stdout
-
-  if (config.mode === 'success') {
-    if (config.chunks) await write_chunks(stream, config.chunks)
-    else stream.write(marker + '\n')
-    return
+function fixture(groups, options = {}) {
+  // Keep failed fixtures for inspection; do not destructively clean worker worktrees.
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'aglite-loop-test-')))
+  const repo = path.join(home, 'repo'), root = path.join(home, 'planned')
+  fs.mkdirSync(repo); fs.mkdirSync(root)
+  git(repo, 'init', '-b', 'main')
+  git(repo, 'config', 'user.name', 'Looper test')
+  git(repo, 'config', 'user.email', 'test@localhost')
+  fs.writeFileSync(path.join(repo, '.gitignore'), '.wts/\n')
+  fs.writeFileSync(path.join(repo, 'owner.txt'), 'owner baseline\n')
+  fs.writeFileSync(path.join(repo, 'shared.txt'), 'baseline\n')
+  const { task = selection, repair, acceptance, max_workers = 2, max_repairs = 2, ...queue_options } = options
+  const config = { 'schema-version': current_schema, switches: { 'saving-mode': 'off' }, 'pipeline-roles': { implementation: 'basic', acceptance: 'better' }, 'model-family': {}, 'looper-routes': {}, 'looper-limits': { 'max-workers': max_workers, 'max-repairs': max_repairs } }
+  for (const [role, value] of Object.entries({ task, repair, acceptance })) if (value) {
+    config['looper-routes'][role] = { kind: value.kind, provider: value.provider, 'model-family': role }
+    if (value.executable) config['looper-routes'][role].executable = value.executable
+    config['model-family'][role] = { [role === 'acceptance' ? 'better' : 'basic']: `${value.model}/${value.effort}` }
   }
+  fs.mkdirSync(path.join(repo, '.agentflow'))
+  fs.writeFileSync(path.join(repo, '.agentflow/ag.json'), JSON.stringify(config))
+  git(repo, 'add', '.gitignore', 'owner.txt', 'shared.txt', '.agentflow/ag.json'); git(repo, 'commit', '-m', 'baseline')
+  const q = { schema_version: 2, run_id: 'fixture', repo, target_branch: 'main', base_commit: git(repo, 'rev-parse', 'HEAD'), request: 'request.md', request_sha256: crypto.createHash('sha256').update('Implement every registered task while preserving owner content.').digest('hex'), authorization: { execute: true, worktrees: true, local_commits: true }, checks: { product: { command: [process.execPath, '-e', 'process.exit(0)'] } }, integration_checks: ['product'], groups: groups.map((tasks, i) => ({ id: `G${i + 1}`, file: `group-${String(i + 1).padStart(3, '0')}.md`, tasks: tasks.map((file, j) => ({ id: `T${i + 1}-${j + 1}`, allowed_paths: [file], checks: ['product'] })) })), ...queue_options }
+  for (const group of q.groups) fs.writeFileSync(path.join(root, group.file), group.tasks.map(t => `## ${t.id}\n\nWrite ${t.allowed_paths[0]}.\n`).join('\n'))
+  fs.writeFileSync(path.join(root, 'request.md'), 'Implement every registered task while preserving owner content.')
+  write(root, q)
+  return { root, repo, q }
+}
+const result = (attempt, outcome = 'pass') => ({ attempt_id: attempt.id, outcome, summary: outcome === 'pass' ? 'Completed assigned work.' : 'Which value should be used?', evidence: [] })
+function closeout(cwd) {
+  const file = path.join(cwd, '.aglite-records/devlog.md')
+  render_notebook(cwd)
+  const source = fs.readFileSync(file, 'utf8')
+  const n = Math.max(0, ...[...source.matchAll(/^# → Reply \/ A-(\d+)$/gm)].map(m => Number(m[1]))) + 1
+  const id = n => String(n).padStart(3, '0')
+  fs.appendFileSync(file, `\n# → Reply / A-${id(n)}\n\nAssigned task completed.\n\n# → Ask / A-${id(n + 1)}\n`)
+}
+function task_edit({ cwd, prompt }) {
+  const match = prompt.match(/Group (\S+), task (\S+); edit only (\[[^\n]+\])\./)
+  assert.ok(match, 'ordinary assignment declares exact editable paths')
+  const files = JSON.parse(match[3])
+  for (const file of files) fs.writeFileSync(path.join(cwd, file), `${match[1]}/${match[2]}\n`)
+  closeout(cwd)
+  return match[2]
+}
+const agent = async args => { fs.mkdirSync(args.attempt_dir, { recursive: true }); task_edit(args); return result(args.attempt) }
+const checks = async ({ ids }) => ids.map(id => ({ id, passed: true }))
 
-  if (config.mode === 'prefix-suffix') {
-    stream.write('prefix ' + marker + ' suffix\n')
-    return
-  }
-
-  if (config.mode === 'logical-split') {
-    stream.write(marker.slice(0, Math.max(1, marker.length - 2)) + '\n')
-    stream.write(marker.slice(-2) + '\n')
-    return
-  }
-
-  if (config.mode === 'duplicate') {
-    process.stdout.write(marker + '\n')
-    process.stderr.write(marker + '\n')
-    return
-  }
-
-  if (config.mode === 'duplicate-stream') {
-    stream.write(marker + '\n')
-    stream.write(marker + '\n')
-    return
-  }
-
-  if (config.mode === 'large-success') {
-    stream.write('x'.repeat(1024 * 1024) + '\n' + marker + '\n')
-    return
-  }
-
-  if (config.mode === 'both-output') {
-    process.stdout.write(config.stdout || 'arbitrary stdout\n')
-    process.stderr.write(config.stderr || 'arbitrary stderr\n')
-    process.stderr.write(marker + '\n')
-    return
-  }
-
-  if (config.mode === 'slow-output') {
-    stream.write((config.output || 'implementation milestone reached') + '\n')
-    await wait(config.delay || 80)
-    stream.write(marker + '\n')
-    return
-  }
-
-  if (config.mode === 'nested') {
-    const nested = spawn(config.nested_executable || process.execPath, [__filename, JSON.stringify({ mode: 'nested-child' })], { stdio: 'ignore' })
-    stream.write('nested child ' + nested.pid + '\n')
-    await wait(300)
-    stream.write(marker + '\n')
-    return
-  }
-
-  if (config.mode === 'nested-child') {
-    setInterval(() => {}, 50)
-    return
-  }
-
-  if (config.mode === 'stop') {
-    stream.write(marker + '\n')
-    fs.writeFileSync(path.join(config.tasks_dir, '.stop.txt'), 'child stop\n', { flag: 'wx' })
-    return
-  }
-
-  if (config.mode === 'add-plan') {
-    stream.write(marker + '\n')
-    fs.writeFileSync(path.join(config.tasks_dir, config.add_name || 'plan-002.md'), 'added\n')
-    return
-  }
-
-  if (config.mode === 'mutate') {
-    stream.write(marker + '\n')
-    const current = fs.existsSync(config.plan_path) ? fs.readFileSync(config.plan_path, 'utf8') : ''
-    if (config.mutation === 'edit') fs.writeFileSync(config.plan_path, current + 'changed\n')
-    if (config.mutation === 'replace') {
-      fs.renameSync(config.plan_path, config.plan_path + '.old')
-      fs.writeFileSync(config.plan_path, 'replacement\n')
+function submit_ordinary_review(args, change = value => value) {
+  const files = JSON.parse(args.prompt.match(/edit only (\[[^\n]+\])\./)[1])
+  const directory = path.join(args.cwd, '.aglite-records/ordinary-review', args.attempt.id)
+  fs.mkdirSync(directory, { recursive: true })
+  const request = change({ version: 1, task_attempt_id: args.attempt.id, request_id: crypto.randomUUID(),
+    source: { head: git(args.cwd, 'rev-parse', 'HEAD'), files: Object.fromEntries(files.map(file => {
+      const absolute = path.join(args.cwd, file)
+      return [file, fs.existsSync(absolute) ? crypto.createHash('sha256').update(fs.readFileSync(absolute)).digest('hex') : null]
+    })) }, context: 'Review original outcome and INV-1 against actual source; checks passed; report missing proof.' })
+  const bytes = JSON.stringify(request)
+  fs.writeFileSync(path.join(directory, 'request.tmp'), bytes)
+  fs.renameSync(path.join(directory, 'request.tmp'), path.join(directory, 'request.json'))
+  return { directory, request, digest: crypto.createHash('sha256').update(bytes).digest('hex') }
+}
+async function relay_response(directory, request_id) {
+  const file = path.join(directory, 'response.json')
+  const deadline = Date.now() + 10000
+  while (true) {
+    if (fs.existsSync(file)) {
+      const response = JSON.parse(fs.readFileSync(file, 'utf8'))
+      if (!request_id || response.request_id === request_id) return response
     }
-    if (config.mutation === 'same-content') {
-      fs.renameSync(config.plan_path, config.plan_path + '.old')
-      fs.writeFileSync(config.plan_path, current)
-    }
-    if (config.mutation === 'symlink') {
-      fs.renameSync(config.plan_path, config.plan_path + '.old')
-      fs.symlinkSync(config.plan_path + '.old', config.plan_path)
-    }
-    if (config.mutation === 'rename') fs.renameSync(config.plan_path, config.plan_path + '.renamed')
-    if (config.mutation === 'remove') fs.unlinkSync(config.plan_path)
-    return
+    assert.ok(Date.now() < deadline, 'ordinary reviewer response arrived')
+    await new Promise(resolve => setTimeout(resolve, 10))
   }
+}
 
-  if (config.mode === 'remove-task-state') {
-    const local_lock = path.join(config.tasks_dir, '.looper.lock')
-    const local_attempt = path.join(config.tasks_dir, '.looper-attempt.json')
-    if (fs.existsSync(local_lock)) fs.rmSync(local_lock, { recursive: true, force: true })
-    if (fs.existsSync(local_attempt)) fs.unlinkSync(local_attempt)
-    if (config.local_action === 'replace') {
-      fs.mkdirSync(local_lock)
-      fs.writeFileSync(path.join(local_lock, 'owner.json'), 'task-local replacement\n')
-      fs.writeFileSync(local_attempt, 'task-local replacement\n')
+test('ordinary review relay preserves configured fresh CLI selection and task closeout', { timeout: 30000 }, async () => {
+  const acceptance = { ...selection, effort: 'high' }
+  const { root, repo } = fixture([['a.txt']], { acceptance })
+  let reviews = 0, task_id, response
+  assert.equal(await L.run(root, { checks, agent: async args => {
+    fs.mkdirSync(args.attempt_dir, { recursive: true })
+    if (args.role === 'review') {
+      reviews++
+      assert.notEqual(args.attempt.id, task_id)
+      assert.equal(args.selection.kind, 'cli')
+      assert.equal(args.selection.provider, acceptance.provider)
+      assert.equal(args.selection.model, acceptance.model)
+      assert.equal(args.selection.effort, 'high')
+      assert.match(args.prompt, /Original authorized request \(context only; execute the selected task\): Implement every registered task/)
+      assert.equal(args.prompt.split('Changed contract inputs at workspace base').length - 1, 1)
+      assert.match(args.prompt, /commands that do not require shell temporary files/)
+      assert.match(args.prompt, /INV-1/)
+      assert.match(args.prompt, /Read only; launch no agents/)
+      return { ...result(args.attempt), evidence: ['INV-1: pass; inspected a.txt.'] }
     }
-    stream.write(marker + '\n')
-    return
-  }
+    task_id = args.attempt.id
+    assert.match(args.prompt, /optional discovery inputs, test existence quietly/)
+    assert.equal(args.selection.effort, 'low')
+    fs.writeFileSync(path.join(args.cwd, 'a.txt'), 'ordinary product\n')
+    const submitted = submit_ordinary_review(args)
+    response = await relay_response(submitted.directory)
+    assert.equal(response.request_sha256, submitted.digest)
+    assert.equal(response.task_attempt_id, args.attempt.id)
+    assert.equal(response.request_id, submitted.request.request_id)
+    assert.deepEqual(response.source, submitted.request.source)
+    assert.equal(response.result.outcome, 'pass')
+    await new Promise(resolve => setTimeout(resolve, 120))
+    assert.equal(reviews, 1, 'unchanged request is not dispatched twice')
+    closeout(args.cwd)
+    return result(args.attempt)
+  } }), 0)
+  assert.equal(reviews, 1)
+  const saved = read(root)
+  assert.equal(saved.groups[0].tasks[0].round, 1)
+  assert.equal(saved.groups[0].attempt, null)
+  assert.equal(saved.groups[0].tasks[0].ordinary_reviews[0].request_id, response.request_id)
+  assert.equal(saved.groups[0].tasks[0].ordinary_reviews[0].attempt.selection.effort, 'high')
+  const request = JSON.parse(fs.readFileSync(path.join(root, 'attempts', task_id, 'ordinary-reviews', response.request_id, 'request.json')))
+  assert.equal(request.task_attempt_id, task_id)
+  assert.equal(fs.readFileSync(path.join(repo, 'a.txt'), 'utf8'), 'ordinary product\n')
+  assert.equal(git(repo, 'ls-tree', '-r', '--name-only', 'HEAD').includes('ordinary-review'), false)
+})
 
-  if (config.mode === 'signal-tree') {
-    const signal_file = config.signal_file
-    const heartbeat_file = config.heartbeat_file
-    const log_signal = (who, signal) => append_json(signal_file, { who, signal, at: Date.now(), pid: process.pid })
-    const on_signal = (signal) => {
-      log_signal('parent', signal)
-      if (config.ignore_first && !config.first_signal_seen) {
-        config.first_signal_seen = true
-        append_json(config.event_file, { event: 'ignored-first-signal', signal, at: Date.now() })
-        return
+test('ordinary review relay rejects stale identity, source hashes, route injection and unsafe paths before dispatch', { timeout: 30000 }, async t => {
+  for (const kind of ['stale', 'source', 'route', 'symlink']) await t.test(kind, async () => {
+    const { root } = fixture([['a.txt']], { acceptance: { ...selection, effort: 'high' } })
+    let reviews = 0
+    assert.equal(await L.run(root, { checks, agent: async args => {
+      if (args.role !== 'task') { reviews++; return result(args.attempt) }
+      const submitted = submit_ordinary_review(args, request => {
+        if (kind === 'stale') request.task_attempt_id = crypto.randomUUID()
+        if (kind === 'source') request.source.files['a.txt'] = '0'.repeat(64)
+        if (kind === 'route') request.provider = 'claude'
+        return request
+      })
+      if (kind === 'symlink') {
+        const file = path.join(submitted.directory, 'request.json')
+        fs.renameSync(file, path.join(submitted.directory, 'original.json'))
+        if (!symlink_or_skip(t, 'original.json', file)) return result(args.attempt, 'blocked')
       }
-      process.exitCode = 0
-    }
-    process.on('SIGINT', () => on_signal('SIGINT'))
-    process.on('SIGTERM', () => on_signal('SIGTERM'))
-    const grandchild = spawn(process.execPath, [__filename, JSON.stringify({
-      mode: 'grandchild',
-      signal_file,
-      heartbeat_file,
-      event_file: config.event_file,
-    })], { stdio: 'ignore' })
-    append_json(config.event_file, { event: 'child-started', pid: process.pid, grandchild: grandchild.pid, at: Date.now() })
-    setInterval(() => fs.appendFileSync(heartbeat_file, Date.now() + '\n'), 20)
-    return
-  }
-
-  if (config.mode === 'grandchild') {
-    const log_signal = (signal) => append_json(config.signal_file, { who: 'grandchild', signal, at: Date.now(), pid: process.pid })
-    process.on('SIGINT', () => log_signal('SIGINT'))
-    process.on('SIGTERM', () => log_signal('SIGTERM'))
-    fs.writeFileSync(config.heartbeat_file + '.ready', 'ready')
-    setInterval(() => fs.appendFileSync(config.heartbeat_file, Date.now() + '\n'), 20)
-    return
-  }
-
-  if (config.mode === 'no-marker') return
-
-  stream.write(config.output || '')
-}
-
-append_json(config.launch_log, {
-  event: 'launch',
-  pid: process.pid,
-  task: config.task,
-  prompt: config.prompt,
-  plan_path: config.plan_path,
-  argv: process.argv.slice(2),
-  at: Date.now(),
-})
-
-const main = async () => {
-  if (config.delay) await wait(config.delay)
-  await output()
-  if (config.mode === 'signal-tree') return
-  if (config.mode === 'exit') process.exitCode = config.exit_code || 7
-  else process.exitCode = config.exit_code || 0
-}
-
-main().catch((error) => {
-  append_json(config.error_log, { message: error.message, stack: error.stack })
-  process.exitCode = 91
-})
-`
-
-const make_temp_dir = (prefix) => make_temp_directory(`${prefix}-`)
-
-const remove_temp_dir = (dir) => {
-  fs.rmSync(dir, { recursive: true, force: true })
-}
-
-// NTFS inode numbers above 2^53 are spaced more than 1 apart as doubles, so
-// `ino + 1` can round back to the same value.
-const other_inode = ino => ino + Math.max(1, 2 ** (Math.floor(Math.log2(ino || 1)) - 51))
-
-// POSIX passes Codex an anonymous descriptor; Windows has no /dev/fd, so it
-// passes the reserved file inside the protected state directory.
-const assert_final_message_argument = argument => process.platform === 'win32'
-  ? assert.match(path.basename(argument), /^\.last-message-plan-\d{3}\.md-[0-9a-f]{32}\.txt$/u)
-  : assert.equal(argument, '/dev/fd/3')
-
-const make_fake_child = (dir) => {
-  const file = path.join(dir, 'fake-child.js')
-  fs.writeFileSync(file, fake_child_source)
-  return file
-}
-
-const make_queue = () => {
-  const dir = make_temp_dir('agentflow-looper-queue')
-  fs.mkdirSync(path.join(dir, 'done'))
-  return dir
-}
-
-const write_plan = (queue, name, content = name) => fs.writeFileSync(path.join(queue, name), `${content}\n`)
-
-const write_generated_queue = (queue, overrides = {}) => {
-  const digest = value => crypto.createHash('sha256').update(value).digest('hex')
-  const built = queue_contract.build_queue({
-    tasks_dir: queue,
-    schema_version: 2,
-    authorities: [
-      { id: 'work', route: 'complex', original_request_sha256: digest('looper generated request'), requirements_sha256: digest('looper generated requirements'), specification_sha256: digest('looper generated specification') },
-      { id: 'integration', route: 'integration', included_authority_ids: ['work'] },
-    ],
-    allow_ag: 'on',
-    contract: {
-      original_request_sha256: digest('looper generated request'),
-      requirements_sha256: digest('looper generated requirements'),
-      specification_sha256: digest('looper generated specification'),
-      requirements: { accepted: true },
-      specification: { accepted: true },
-      brownfield: false,
-      mandatory_stages: ['requirements', 'specification'],
-      stage_records: [],
-      unresolved_decisions: [],
-    },
-    plans: [
-      {
-        order: 1,
-        contract_part: 'utility',
-        outcome: 'Implement the generated utility.',
-        dependencies: [],
-        required_work: ['Implement the utility.'],
-        constraints: ['Keep scope bounded.'],
-        tests_and_evidence: ['Run focused tests.'],
-        completion_conditions: ['The utility passes.'],
-        final_integration: false,
-      },
-      {
-        order: 2,
-        contract_part: 'documentation',
-        outcome: 'Document the generated utility.',
-        dependencies: ['plan-001.md'],
-        required_work: ['Document the utility.'],
-        constraints: ['Change documentation only.'],
-        tests_and_evidence: ['Check the example.'],
-        completion_conditions: ['The example matches behavior.'],
-        final_integration: false,
-      },
-      {
-        order: 3,
-        contract_part: 'final-integration',
-        outcome: 'Verify the complete generated request.',
-        dependencies: ['plan-002.md'],
-        required_work: ['Run the integration suite.'],
-        constraints: ['Change integration tests only.'],
-        tests_and_evidence: ['Run the complete suite.'],
-        completion_conditions: ['All generated work passes together.'],
-        final_integration: true,
-      },
-    ].map(plan => ({ ...plan, route: plan.final_integration ? 'integration' : 'complex', authority_id: plan.final_integration ? 'integration' : 'work' })),
-    completion_path: overrides.completion_path || 'records/work.devlog.md',
-    generation_id: 'looper-generated-001',
-    created_at: '2026-08-30T14:00:00.000Z',
+      await new Promise(resolve => {
+        if (args.signal.aborted) resolve()
+        else args.signal.addEventListener('abort', resolve, { once: true })
+      })
+      return result(args.attempt, 'blocked')
+    } }), 2)
+    assert.equal(reviews, 0)
+    assert.match(read(root).questions[0].question, /Malformed or stale|source identity|Symlink/)
+    assert.equal(fs.existsSync(path.join(root, '.queue.owner')), false)
   })
-  for (const [name, bytes] of Object.entries(built.plan_bytes)) fs.writeFileSync(path.join(queue, name), bytes)
-  fs.writeFileSync(path.join(queue, queue_contract.ENVELOPE_NAME), `${JSON.stringify(built.envelope)}\n`)
-  return built
-}
+})
 
-const read_json_lines = (file) => {
-  if (!fs.existsSync(file)) return []
-  return fs.readFileSync(file, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
-}
+test('ordinary review relay blocks changed source and preserves structured blocked evidence', { timeout: 30000 }, async () => {
+  const { root } = fixture([['a.txt']], { acceptance: { ...selection, effort: 'high' } })
+  assert.equal(await L.run(root, { checks, agent: async args => {
+    if (args.role === 'review') {
+      // Simulate a task changing its product while its reviewer is inspecting it.
+      fs.writeFileSync(path.join(args.cwd, 'a.txt'), 'moved source\n')
+      return result(args.attempt)
+    }
+    fs.writeFileSync(path.join(args.cwd, 'a.txt'), 'original source\n')
+    const submitted = submit_ordinary_review(args)
+    const response = await relay_response(submitted.directory)
+    assert.equal(response.result.outcome, 'blocked')
+    assert.match(response.result.summary, /source changed during review/)
+    return { ...result(args.attempt, 'blocked'), summary: response.result.summary, evidence: [response.evidence_dir] }
+  } }), 2)
+  const saved = read(root)
+  const attempt = saved.groups[0].attempt
+  assert.equal(attempt.ordinary_reviews[0].state, 'blocked')
+  assert.equal(attempt.result.outcome, 'blocked')
+  assert.deepEqual(saved.questions[0].evidence, attempt.result.evidence)
+  assert.equal(saved.questions[0].attempt_dir, path.join(root, 'attempts', attempt.id))
+  assert.equal(saved.groups[0].tasks[0].candidate, undefined)
+})
 
-const read_json = (file) => JSON.parse(fs.readFileSync(file, 'utf8'))
+test('ordinary review sibling process settles before task slot and claims release', { timeout: 30000 }, async () => {
+  const { execute } = require('./looper-agent')
+  const S = require('./looper-state')
+  const { root } = fixture([['a.txt']], { acceptance: { ...selection, effort: 'high' } })
+  const launched = deferred()
+  let identity, observation
+  assert.equal(await L.run(root, { checks, agent: async args => {
+    fs.mkdirSync(args.attempt_dir, { recursive: true })
+    if (args.role === 'review') {
+      observation = await execute({ command: [process.execPath, '-e', 'setInterval(() => {}, 1000)'], cwd: args.cwd,
+        log: path.join(args.attempt_dir, 'review-process.log'), signal: args.signal,
+        on_launch: async proc => { identity = proc; await args.on_launch(proc); launched.resolve() },
+        on_descendant: args.on_descendant })
+      return result(args.attempt)
+    }
+    submit_ordinary_review(args)
+    await launched.promise
+    assert.ok(read(root).processes.some(proc => proc.pid === identity.pid))
+    closeout(args.cwd)
+    return result(args.attempt) // Exiting with an outstanding request cancels its sibling.
+  } }), 2)
+  assert.equal(observation.aborted, true)
+  assert.equal(S.writer_stopped(identity), true)
+  const saved = read(root)
+  assert.equal(saved.groups[0].attempt.ordinary_reviews[0].state, 'cancelled')
+  assert.match(saved.questions[0].question, /before ordinary review settled/)
+  assert.deepEqual(saved.processes, [])
+  assert.equal(fs.existsSync(path.join(root, '.queue.owner')), false)
+})
 
-const protected_state_dir = (queue) => path.join(
-  test_state_root,
-  'agentflow',
-  'looper',
-  crypto.createHash('sha256').update(fs.realpathSync(queue)).digest('hex'),
-)
+test('ordinary review pass requires latest successful verdict and unchanged source at return and resume', { timeout: 30000 }, async t => {
+  for (const kind of ['after-verdict', 'repair-verdict', 'saved-pass', 'pending-import']) await t.test(kind, async () => {
+    const { root } = fixture([['a.txt']], { acceptance: { ...selection, effort: 'high' } })
+    let cwd
+    assert.equal(await L.run(root, { checks, agent: async args => {
+      fs.mkdirSync(args.attempt_dir, { recursive: true })
+      if (args.role === 'review') return result(args.attempt, kind === 'repair-verdict' ? 'repair' : 'pass')
+      cwd = args.cwd
+      fs.writeFileSync(path.join(cwd, 'a.txt'), 'reviewed product\n')
+      const submitted = submit_ordinary_review(args)
+      await relay_response(submitted.directory)
+      closeout(cwd)
+      if (kind === 'after-verdict') fs.writeFileSync(path.join(cwd, 'a.txt'), 'unreviewed product\n')
+      if (kind === 'saved-pass' || kind === 'pending-import') {
+        fs.writeFileSync(path.join(args.attempt_dir, 'result.json'), JSON.stringify(result(args.attempt)))
+        fs.writeFileSync(path.join(args.attempt_dir, 'exit.json'), JSON.stringify({ exit_code: 0 }))
+        return result(args.attempt, 'blocked')
+      }
+      return result(args.attempt)
+    } }), 2)
+    if (kind === 'saved-pass' || kind === 'pending-import') {
+      if (kind === 'saved-pass') fs.writeFileSync(path.join(cwd, 'a.txt'), 'changed after process stopped\n')
+      else {
+        const interrupted = read(root)
+        interrupted.groups[0].attempt.ordinary_reviews[0].state = 'pending'
+        write(root, interrupted) // Simulate a crash before the parent persisted review completion.
+      }
+      fs.mkdirSync(path.join(root, 'inbox'), { recursive: true })
+      fs.writeFileSync(path.join(root, 'inbox/answers.json'), JSON.stringify([{ id: read(root).questions[0].id, answer: 'Continue preserved task.', source: 'host' }]))
+      assert.equal(await L.run(root, { checks, agent: () => { throw Error('Unexpected replacement worker') } }), 2)
+    }
+    const saved = read(root)
+    assert.match(saved.questions.filter(item => !item.answer).at(-1).question,
+      /changed after its latest successful|lacks a successful latest|unsettled ordinary review/)
+    assert.equal(saved.groups[0].tasks[0].candidate, undefined)
+  })
+})
 
-const attempt_path = (queue) => path.join(protected_state_dir(queue), '.looper-attempt.json')
-const lock_path = (queue) => path.join(protected_state_dir(queue), '.looper.lock')
-const local_lock_path = (queue) => path.join(queue, '.looper.lock')
-const local_attempt_path = (queue) => path.join(queue, '.looper-attempt.json')
-const stop_path = (queue) => path.join(queue, '.stop.txt')
-const file_sha256 = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')
+test('ordinary review repair findings return to task before a fresh review of corrected bytes', { timeout: 30000 }, async () => {
+  const { root } = fixture([['a.txt']], { acceptance: { ...selection, effort: 'high' } })
+  const reviewers = []
+  assert.equal(await L.run(root, { checks, agent: async args => {
+    if (args.role === 'review') {
+      reviewers.push(args.attempt.id)
+      assert.equal(fs.readFileSync(path.join(args.cwd, 'a.txt'), 'utf8'), reviewers.length === 1 ? 'defect\n' : 'corrected\n')
+      return result(args.attempt, reviewers.length === 1 ? 'repair' : 'pass')
+    }
+    for (const [content, outcome] of [['defect\n', 'repair'], ['corrected\n', 'pass']]) {
+      fs.writeFileSync(path.join(args.cwd, 'a.txt'), content)
+      const submitted = submit_ordinary_review(args)
+      const response = await relay_response(submitted.directory, submitted.request.request_id)
+      assert.equal(response.result.outcome, outcome)
+    }
+    closeout(args.cwd)
+    return result(args.attempt)
+  } }), 0)
+  assert.equal(reviewers.length, 2)
+  assert.notEqual(reviewers[0], reviewers[1])
+})
 
-const make_completed_record = (queue, task = 'plan-001.md') => {
-  const canonical_queue = fs.realpathSync(queue)
-  const archive_path = path.join(canonical_queue, 'done', task)
-  fs.writeFileSync(archive_path, 'archived completed plan\n')
-  const stat = fs.statSync(archive_path)
-  const sha256 = file_sha256(archive_path)
-  return {
-    version: 1,
-    phase: 'completed',
-    task,
-    selected_path: path.join(canonical_queue, task),
-    dev: stat.dev,
-    ino: stat.ino,
-    size: stat.size,
-    sha256,
-    completion_line,
-    exit_code: 0,
-    signal: null,
-    completion_matches: 1,
-    rechecked_sha256: sha256,
-    rechecked_dev: stat.dev,
-    rechecked_ino: stat.ino,
-    rechecked_size: stat.size,
-    archived_path: archive_path,
-    archived: true,
-    archived_sha256: sha256,
-    archived_dev: stat.dev,
-    archived_ino: stat.ino,
-    archived_size: stat.size,
+test('ordinary review supports directory scopes and rejects dirty predecessor inputs', { timeout: 30000 }, async t => {
+  for (const dirty_predecessor of [false, true]) await t.test(String(dirty_predecessor), async () => {
+    const { root } = fixture([['docs']], { acceptance: { ...selection, effort: 'high' } })
+    let reviews = 0
+    assert.equal(await L.run(root, { checks, agent: async args => {
+      if (args.role === 'review') { reviews++; return result(args.attempt) }
+      fs.mkdirSync(path.join(args.cwd, 'docs'))
+      fs.writeFileSync(path.join(args.cwd, 'docs/a.md'), 'directory product\n')
+      const submitted = submit_ordinary_review({ ...args, prompt: args.prompt.replace('edit only ["docs"].', 'edit only ["docs/a.md"].') })
+      if (dirty_predecessor) {
+        fs.writeFileSync(path.join(args.cwd, 'shared.txt'), 'unreviewed predecessor movement\n')
+        await new Promise(resolve => args.signal.addEventListener('abort', resolve, { once: true }))
+        return result(args.attempt, 'blocked')
+      }
+      assert.equal((await relay_response(submitted.directory)).result.outcome, 'pass')
+      closeout(args.cwd)
+      return result(args.attempt)
+    } }), dirty_predecessor ? 2 : 0)
+    assert.equal(reviews, dirty_predecessor ? 0 : 1)
+    if (dirty_predecessor) assert.match(read(root).questions[0].question, /out-of-scope source change: shared.txt/)
+  })
+})
+
+test('ordinary review binds commit-intent recovery before staging and after committed HEAD advancement', { timeout: 30000 }, async t => {
+  for (const committed of [false, true]) for (const changed of [false, true])
+    await t.test(`committed=${committed}; changed=${changed}`, async () => {
+      const { root, repo } = fixture([['a.txt']], { acceptance: { ...selection, effort: 'high' } })
+      let image, calls = 0
+      assert.equal(await L.run(root, { checks, agent: async args => {
+        if (args.role === 'review') return result(args.attempt)
+        calls++
+        fs.writeFileSync(path.join(args.cwd, 'a.txt'), 'reviewed bytes\n')
+        const submitted = submit_ordinary_review(args)
+        await relay_response(submitted.directory, submitted.request.request_id)
+        closeout(args.cwd)
+        return result(args.attempt)
+      }, on_save: q => {
+        const group = q.groups[0], task = group.tasks[0]
+        if (task.commit_intent && !image) {
+          image = structuredClone(q)
+          if (changed) fs.writeFileSync(path.join(group.workspace.worktree, 'a.txt'), 'unreviewed bytes\n')
+          if (committed) {
+            git(group.workspace.worktree, 'add', 'a.txt')
+            git(group.workspace.worktree, 'commit', '-m', task.commit_intent.message)
+          }
+          throw Error('Injected crash at reviewed task commit intent')
+        }
+      } }), 2)
+      assert.equal(image.groups[0].tasks[0].ordinary_reviews[0].result.outcome, 'pass')
+      write(root, image)
+      assert.equal(await L.run(root, { checks, agent: () => { throw Error('Recovery repeated a task worker') } }), changed ? 2 : 0)
+      assert.equal(calls, 1)
+      const saved = read(root)
+      if (changed) {
+        assert.match(saved.questions.at(-1).question, /changed after its latest successful ordinary review/)
+        assert.equal(fs.existsSync(path.join(repo, 'a.txt')), false)
+        assert.equal(saved.groups[0].tasks[0].candidate, undefined)
+      } else {
+        assert.equal(saved.groups[0].tasks[0].ordinary_reviews[0].result.outcome, 'pass')
+        assert.equal(fs.readFileSync(path.join(repo, 'a.txt'), 'utf8'), 'reviewed bytes\n')
+      }
+    })
+})
+
+function simulate_dead_coordinator(root, repo) {
+  const common = path.resolve(repo, git(repo, 'rev-parse', '--git-common-dir'))
+  const claims = [path.join(root, '.queue.owner'), ...fs.readdirSync(common)
+    .filter(file => /^aglite-target-.*\.owner$/.test(file)).map(file => path.join(common, file))]
+  for (const file of claims) {
+    const claim = JSON.parse(fs.readFileSync(file, 'utf8'))
+    fs.writeFileSync(file, JSON.stringify({ ...claim, pid: 2147483647, started_at: 'simulated-dead-coordinator' }))
   }
 }
+test('ordinary review native child preserves claims and slot until explicit stopped or never-dispatched import', { timeout: 30000 }, async t => {
+  for (const dispatched of [false, true]) await t.test(`dispatched=${dispatched}`, async () => {
+    const { spawn } = require('node:child_process')
+    const { root, repo } = fixture([['a.txt'], ['b.txt']], { acceptance: { ...selection, kind: 'native', effort: 'high' }, max_workers: 1 })
+    let calls = 0, native_child
+    try {
+      assert.equal(await L.run(root, { checks, agent: async args => {
+        calls++
+        assert.equal(args.role, 'task', 'native acceptance must never substitute CLI')
+        assert.equal(calls, 1, 'pending native review keeps the single group slot')
+        fs.writeFileSync(path.join(args.cwd, 'a.txt'), 'product awaiting native review\n')
+        submit_ordinary_review(args)
+        const deadline = Date.now() + 5000
+        while (!read(root).handoffs.length) {
+          assert.ok(Date.now() < deadline)
+          await new Promise(resolve => setTimeout(resolve, 10))
+        }
+        if (dispatched) {
+          native_child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+          await new Promise((resolve, reject) => { native_child.once('spawn', resolve); native_child.once('error', reject) })
+        }
+        closeout(args.cwd)
+        return result(args.attempt)
+      } }), 2)
+      let saved = read(root)
+      const parent_id = saved.groups[0].attempt.id
+      const handoff = saved.handoffs[0]
+      assert.equal(handoff.parent_attempt_id, parent_id)
+      assert.equal(handoff.cancel_requested, true)
+      assert.equal(handoff.completed, false)
+      assert.equal(saved.groups[1].workspace, undefined)
+      assert.equal(fs.existsSync(path.join(root, '.queue.owner')), true)
+      assert.equal(saved.groups[0].attempt.ordinary_reviews[0].state, 'pending')
+      const forbidden = () => { throw Error('Replacement dispatched before native settlement') }
+      simulate_dead_coordinator(root, repo)
+      assert.equal(await L.run(root, { checks, agent: forbidden }), 2)
+      assert.equal(read(root).groups[0].attempt.id, parent_id)
+      assert.equal(fs.existsSync(path.join(root, '.queue.owner')), true)
+      fs.mkdirSync(path.join(root, 'inbox'), { recursive: true })
+      const mailbox = path.join(root, 'inbox', `${handoff.id}.json`)
+      fs.writeFileSync(mailbox, JSON.stringify({ ...result({ id: handoff.id }, 'blocked'), writer_stopped: false }))
+      simulate_dead_coordinator(root, repo)
+      assert.equal(await L.run(root, { checks, agent: forbidden }), 2)
+      assert.equal(read(root).handoffs[0].completed, false)
+      assert.equal(fs.existsSync(path.join(root, '.queue.owner')), true)
+      answer(root, read(root).questions.find(item => !item.answer), 'owner')
+      simulate_dead_coordinator(root, repo)
+      await assert.rejects(L.run(root, { checks, agent: forbidden }), /Native ordinary review settlement pending/)
+      assert.equal(read(root).groups[0].attempt.id, parent_id)
+      assert.equal(read(root).handoffs[0].completed, false)
+      fs.writeFileSync(path.join(root, 'inbox/answers.json'), '[]')
+      if (native_child) {
+        const stopped = new Promise(resolve => native_child.once('close', resolve))
+        native_child.kill('SIGTERM')
+        await stopped
+      }
+      fs.writeFileSync(mailbox, JSON.stringify({ ...result({ id: handoff.id }, 'blocked'),
+        summary: dispatched ? 'Host stopped the actual reviewer.' : 'Host never dispatched the reviewer.',
+        ...(dispatched ? { writer_stopped: true } : { dispatched: false }) }))
+      simulate_dead_coordinator(root, repo)
+      assert.equal(await L.run(root, { checks, agent: async args => {
+        assert.match(args.prompt, /Group G2,/, 'only unrelated work may start before the parent task receives a correction')
+        return agent(args)
+      } }), 2)
+      saved = read(root)
+      assert.equal(saved.handoffs[0].completed, true)
+      assert.equal(saved.handoffs[0].not_dispatched, dispatched ? undefined : true)
+      assert.equal(saved.groups[0].attempt.ordinary_reviews[0].state, 'cancelled')
+      assert.equal(fs.existsSync(path.join(root, '.queue.owner')), false)
+      answer(root, saved.questions.find(item => !item.answer), 'owner')
+      assert.equal(await L.run(root, { checks, agent }), 0, L.status(root))
+      assert.equal(read(root).groups[0].tasks[0].ordinary_reviews[0].parent_attempt_id, parent_id)
+    } finally {
+      if (native_child && native_child.exitCode === null && native_child.signalCode === null) native_child.kill('SIGKILL')
+    }
+  })
+})
 
-const write_completed_fixture = (mutate = () => {}) => {
-  const dir = make_temp_dir('agentflow-looper-completed-record')
-  const queue = path.join(dir, 'queue')
-  fs.mkdirSync(path.join(queue, 'done'), { recursive: true })
-  const fake_child = make_fake_child(dir)
-  write_plan(queue, 'plan-002.md', 'later plan')
-  const record = make_completed_record(queue)
-  mutate({ dir, queue, record })
-  fs.mkdirSync(protected_state_dir(queue), { recursive: true, mode: 0o700 })
-  fs.writeFileSync(attempt_path(queue), `${JSON.stringify(record)}\n`)
-  return { dir, queue, fake_child, before: fs.readFileSync(attempt_path(queue)) }
-}
+test('ordinary review cancelled native saved pass renews only after settlement and correction, archiving its own marker', { timeout: 30000 }, async t => {
+  for (const correction of ['host', 'owner']) await t.test(correction, async () => {
+    const { root, repo } = fixture([['a.txt']], { acceptance: { ...selection, kind: 'native', effort: 'high' } })
+    let original, marker, saved_result, calls = 0
+    assert.equal(await L.run(root, { checks, agent: async args => {
+      calls++; original = args.attempt.id
+      fs.mkdirSync(args.attempt_dir, { recursive: true })
+      marker = path.join(args.cwd, '.aglite-records/.devlog.md.owner')
+      fs.writeFileSync(marker, JSON.stringify({ session: original }))
+      fs.writeFileSync(path.join(args.cwd, 'a.txt'), 'preserved product\n')
+      submit_ordinary_review(args)
+      const deadline = Date.now() + 5000
+      while (!read(root).handoffs.length) {
+        assert.ok(Date.now() < deadline)
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+      closeout(args.cwd)
+      saved_result = JSON.stringify(result(args.attempt))
+      fs.writeFileSync(path.join(args.attempt_dir, 'result.json'), saved_result)
+      fs.writeFileSync(path.join(args.attempt_dir, 'exit.json'), JSON.stringify({ exit_code: 0 }))
+      return result(args.attempt)
+    } }), 2)
+    const blocked = read(root), handoff = blocked.handoffs[0]
+    const archived = path.join(root, 'attempts', original, 'notebook-owner.released.json')
+    assert.equal(fs.existsSync(marker), true)
+    assert.equal(fs.existsSync(archived), false)
+    answer(root, blocked.questions[0], correction)
+    simulate_dead_coordinator(root, repo)
+    await assert.rejects(L.run(root, { checks, agent: () => { throw Error('Unsettled task repeated') } }), /Native ordinary review settlement pending/)
+    assert.equal(calls, 1)
+    assert.equal(fs.existsSync(marker), true)
+    fs.mkdirSync(path.join(root, 'inbox'), { recursive: true })
+    fs.writeFileSync(path.join(root, 'inbox', `${handoff.id}.json`), JSON.stringify({
+      ...result({ id: handoff.id }, 'blocked'), dispatched: false, summary: 'Live host never dispatched this exact reviewer.' }))
+    simulate_dead_coordinator(root, repo)
+    if (correction === 'owner') {
+      fs.writeFileSync(marker, JSON.stringify({ session: 'foreign-marker-session' }))
+      await assert.rejects(L.run(root, { checks, agent: () => { throw Error('Foreign marker was replaced') } }), /Foreign isolated notebook claim/)
+      assert.equal(JSON.parse(fs.readFileSync(marker)).session, 'foreign-marker-session')
+      assert.equal(fs.existsSync(archived), false)
+      assert.equal(calls, 1)
+      fs.writeFileSync(marker, JSON.stringify({ session: original }))
+    }
+    assert.equal(await L.run(root, { checks, agent: async args => {
+      calls++
+      assert.notEqual(args.attempt.id, original, 'saved pass must not be imported as successful work')
+      assert.equal(fs.existsSync(marker), false)
+      assert.equal(JSON.parse(fs.readFileSync(archived)).session, original)
+      assert.equal(fs.readFileSync(path.join(args.cwd, 'a.txt'), 'utf8'), 'preserved product\n')
+      fs.writeFileSync(path.join(args.cwd, 'a.txt'), 'preserved product\ncorrected completion\n')
+      closeout(args.cwd)
+      return result(args.attempt)
+    } }), 0, L.status(root))
+    assert.equal(calls, 2)
+    assert.equal(fs.readFileSync(path.join(root, 'attempts', original, 'result.json'), 'utf8'), saved_result)
+    assert.equal(read(root).groups[0].tasks[0].ordinary_reviews[0].state, 'cancelled')
+  })
+})
 
-const write_attempt_replacement_fixture = () => {
-  const dir = make_temp_dir('agentflow-looper-attempt-replacement')
-  const queue = path.join(dir, 'queue')
-  fs.mkdirSync(path.join(queue, 'done'), { recursive: true })
-  const fake_child = make_fake_child(dir)
-  write_plan(queue, 'plan-002.md', 'later plan')
-  const replacement_record = make_completed_record(queue)
-  const original_bytes = Buffer.from(JSON.stringify({
-    phase: 'launch-intent',
-    task: 'plan-001.md',
-  }) + '\n')
-  fs.mkdirSync(protected_state_dir(queue), { recursive: true, mode: 0o700 })
-  fs.writeFileSync(attempt_path(queue), original_bytes)
-  return {
-    dir,
-    queue,
-    fake_child,
-    original_bytes,
-    replacement_bytes: Buffer.from(JSON.stringify(replacement_record) + '\n'),
+test('ordinary review missing native handoff imports only exact truthful never-dispatched proof', { timeout: 30000 }, async () => {
+  const { root, repo } = fixture([['a.txt']], { acceptance: { ...selection, kind: 'native', effort: 'high' } })
+  let image
+  assert.equal(await L.run(root, { checks, agent: async args => {
+    fs.writeFileSync(path.join(args.cwd, 'a.txt'), 'preserved crash product\n')
+    const submitted = submit_ordinary_review(args)
+    assert.equal((await relay_response(submitted.directory)).result.outcome, 'blocked')
+    return result(args.attempt, 'blocked')
+  }, on_save: q => {
+    if (!image && q.groups[0].attempt?.ordinary_reviews?.[0]?.attempt && !q.handoffs.length) {
+      image = structuredClone(q)
+      throw Error('Crash after native selection save, before assignment and handoff creation')
+    }
+  } }), 2)
+  const parent = image.groups[0].attempt, review = parent.ordinary_reviews[0]
+  assert.equal(fs.existsSync(path.join(root, 'attempts', review.attempt.id, 'assignment.md')), false)
+  assert.equal(image.handoffs.length, 0)
+  write(root, image)
+  simulate_dead_coordinator(root, repo)
+  const forbidden = () => { throw Error('Unknown native child was silently replaced') }
+  assert.equal(await L.run(root, { checks, agent: forbidden }), 2)
+  assert.equal(fs.existsSync(path.join(root, '.queue.owner')), true)
+  assert.equal(read(root).handoffs.length, 0)
+  assert.equal(read(root).groups[0].attempt.id, parent.id)
+  fs.mkdirSync(path.join(root, 'inbox'), { recursive: true })
+  const mailbox = path.join(root, 'inbox', `${review.attempt.id}.json`)
+  for (const invalid of [
+    { ...result({ id: crypto.randomUUID() }, 'blocked'), dispatched: false },
+    { ...result(review.attempt, 'blocked'), writer_stopped: false },
+    { ...result(review.attempt, 'blocked'), writer_stopped: true }
+  ]) {
+    fs.writeFileSync(mailbox, JSON.stringify(invalid))
+    simulate_dead_coordinator(root, repo)
+    assert.equal(await L.run(root, { checks, agent: forbidden }), 2)
+    assert.equal(read(root).handoffs.length, 0)
+    assert.equal(fs.existsSync(path.join(root, '.queue.owner')), true)
   }
-}
+  fs.writeFileSync(mailbox, JSON.stringify({ ...result(review.attempt, 'blocked'),
+    dispatched: false, summary: 'Live host verified this exact saved reviewer was never dispatched.' }))
+  simulate_dead_coordinator(root, repo)
+  assert.equal(await L.run(root, { checks, agent: forbidden }), 2)
+  const settled = read(root), recovered = settled.handoffs[0]
+  assert.equal(recovered.id, review.attempt.id)
+  assert.equal(recovered.parent_attempt_id, parent.id)
+  assert.deepEqual(recovered.selection, review.attempt.selection)
+  assert.equal(recovered.completed, true)
+  assert.equal(recovered.not_dispatched, true)
+  assert.equal(recovered.recovered_without_dispatch, true)
+  assert.equal(recovered.assignment, undefined, 'recovery must invent no dispatch evidence')
+  assert.equal(settled.groups[0].attempt.ordinary_reviews[0].result.writer_stopped, undefined)
+  assert.equal(fs.existsSync(path.join(root, '.queue.owner')), false)
+  answer(root, settled.questions.find(item => !item.answer), 'host')
+  assert.equal(await L.run(root, { checks, agent }), 0)
+})
 
-const write_attempt_input_fixture = (content = '{"phase":"launch-intent"}\n') => {
-  const dir = make_temp_dir('agentflow-looper-attempt-input')
-  const queue = make_queue()
-  const fake_child = make_fake_child(dir)
-  write_plan(queue, 'plan-001.md')
-  fs.mkdirSync(protected_state_dir(queue), { recursive: true, mode: 0o700 })
-  fs.writeFileSync(attempt_path(queue), content)
-  return { dir, queue, fake_child }
-}
+test('ordinary review cancelled CLI saved result renews only with saved process settlement and host correction', { timeout: 30000 }, async t => {
+  for (const outcome of ['pass', 'blocked']) await t.test(outcome, async () => {
+    const A = require('./looper-agent'), S = require('./looper-state')
+    const { root } = fixture([['a.txt']], { acceptance: { ...selection, effort: 'high' } })
+    const launched = deferred()
+    let original, reviewer, marker, saved_result, calls = 0
+    assert.equal(await L.run(root, { checks, agent: async args => {
+      fs.mkdirSync(args.attempt_dir, { recursive: true })
+      if (args.role === 'review') {
+        reviewer = args.attempt.id
+        const observation = await A.execute({ command: [process.execPath, '-e', 'setInterval(() => {}, 1000)'],
+          cwd: args.cwd, signal: args.signal, log: path.join(args.attempt_dir, 'transcript.log'),
+          on_launch: async identity => {
+            S.write_json(path.join(args.attempt_dir, 'process.json'), identity)
+            await args.on_launch(identity)
+            launched.resolve()
+          }, on_descendant: A.descendant_recorder(path.join(args.attempt_dir, 'descendants.json'), args.on_descendant) })
+        S.write_json(path.join(args.attempt_dir, 'exit.json'), observation)
+        assert.equal(observation.aborted, true)
+        throw Error('Reviewer stopped after its task returned early')
+      }
+      calls++; original = args.attempt.id
+      marker = path.join(args.cwd, '.aglite-records/.devlog.md.owner')
+      fs.writeFileSync(marker, JSON.stringify({ session: original }))
+      fs.writeFileSync(path.join(args.cwd, 'a.txt'), 'preserved CLI product\n')
+      submit_ordinary_review(args)
+      await launched.promise
+      closeout(args.cwd)
+      saved_result = JSON.stringify(result(args.attempt, outcome))
+      fs.writeFileSync(path.join(args.attempt_dir, 'result.json'), saved_result)
+      S.write_json(path.join(args.attempt_dir, 'exit.json'), { exit_code: 0, root_closed: true, spawned: true })
+      return result(args.attempt, outcome)
+    } }), 2)
+    let blocked = read(root)
+    assert.equal(blocked.groups[0].attempt.ordinary_reviews[0].state, 'cancelled')
+    assert.ok(blocked.groups[0].attempt.ordinary_reviews[0].attempt.stopped_at)
+    assert.equal(fs.existsSync(marker), true)
+    const exit_file = path.join(root, 'attempts', reviewer, 'exit.json')
+    const exit_bytes = fs.readFileSync(exit_file)
+    if (outcome === 'pass') {
+      S.write_json(exit_file, { ...JSON.parse(exit_bytes), root_closed: false })
+      answer(root, blocked.questions.find(item => !item.answer), 'host')
+      assert.equal(await L.run(root, { checks, agent: () => { throw Error('Unproved CLI cancellation repeated its task') } }), 2)
+      assert.equal(calls, 1)
+      assert.equal(fs.existsSync(marker), true)
+      assert.match(read(root).questions.filter(item => !item.answer).at(-1).question, /unsettled ordinary review/)
+      fs.writeFileSync(exit_file, exit_bytes)
+      blocked = read(root)
+    }
+    answer(root, blocked.questions.find(item => !item.answer), 'host')
+    assert.equal(await L.run(root, { checks, agent: async args => {
+      calls++
+      assert.notEqual(args.attempt.id, original)
+      assert.equal(fs.existsSync(marker), false)
+      assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'attempts', original, 'notebook-owner.released.json'))).session, original)
+      assert.equal(fs.readFileSync(path.join(args.cwd, 'a.txt'), 'utf8'), 'preserved CLI product\n')
+      fs.writeFileSync(path.join(args.cwd, 'a.txt'), 'preserved CLI product\ncorrected completion\n')
+      closeout(args.cwd)
+      return result(args.attempt)
+    } }), 0, L.status(root))
+    assert.equal(calls, 2)
+    assert.equal(fs.readFileSync(path.join(root, 'attempts', original, 'result.json'), 'utf8'), saved_result)
+    assert.deepEqual(fs.readFileSync(exit_file), exit_bytes)
+  })
+})
 
-const assert_untrustworthy_completed_record_blocks = async (fixture) => {
-  const launch_log = path.join(fixture.dir, 'launch.jsonl')
+test('real Git integration preserves disjoint owner edits, sequential fresh tasks, and ancestry', { timeout: 30000 }, async () => {
+  const { root, repo, q } = fixture([['a.txt', 'b.txt'], ['c.txt']])
+  fs.writeFileSync(path.join(repo, 'owner.txt'), 'unfinished owner edit\n')
+  const attempts = [], active = new Set(), first = deferred()
+  let overlap = false
+  assert.equal(await L.run(root, { checks, agent: async args => {
+    const group = args.prompt.match(/Group (\S+), task/)[1]
+    assert.ok(!active.has(group), 'a group has one worker at a time')
+    active.add(group); attempts.push(args.attempt.id)
+    if (active.size === 2) { overlap = true; first.resolve() }
+    await first.promise
+    const answer = await agent(args)
+    active.delete(group)
+    return answer
+  } }), 0)
+  const saved = read(root)
+  assert.ok(overlap)
+  assert.equal(new Set(attempts).size, 3)
+  assert.equal(saved.groups[0].tasks[0].round, 1)
+  assert.equal(saved.groups[0].tasks[1].round, 2)
+  assert.equal(fs.readFileSync(path.join(repo, 'owner.txt'), 'utf8'), 'unfinished owner edit\n')
+  for (const group of saved.groups) {
+    assert.equal(git(repo, 'merge-base', group.candidate, 'HEAD'), group.candidate)
+    for (const task of group.tasks) assert.equal(fs.readFileSync(path.join(repo, task.allowed_paths[0]), 'utf8'), `${group.id}/${task.id}\n`)
+  }
+  assert.equal(git(repo, 'merge-base', q.base_commit, 'HEAD'), q.base_commit)
+  assert.equal(git(repo, 'ls-tree', '-r', '--name-only', 'HEAD').includes('.aglite-records'), false)
+})
+
+test('third group starts while first integration waits and second task still runs', { timeout: 30000 }, async () => {
+  const { root } = fixture([['a.txt'], ['b.txt'], ['c.txt']])
+  const third = deferred(), integration = deferred(), second = deferred()
+  let merging = false, thirdStarted = false
+  const execution = L.run(root, { agent: async args => {
+    if (args.prompt.includes('Group G2,')) await second.promise
+    if (args.prompt.includes('Group G3,')) { thirdStarted = true; third.resolve() }
+    return agent(args)
+  }, checks: async args => {
+    if (path.basename(args.cwd).startsWith('aglite-merge-') && !merging) { merging = true; await integration.promise }
+    return checks(args)
+  } })
+  await third.promise
+  assert.ok(thirdStarted)
+  assert.equal(read(root).groups[1].state, 'working')
+  second.resolve(); integration.resolve()
+  assert.equal(await execution, 0)
+})
+
+test('stopped question blocks only its group, releases slot, and owner answer resumes', { timeout: 30000 }, async () => {
+  const { root } = fixture([['a.txt'], ['b.txt']], { max_workers: 1 })
+  let asked = false
+  assert.equal(await L.run(root, { checks, agent: async args => {
+    if (!asked) { asked = true; return result(args.attempt, 'needs_owner') }
+    return agent(args)
+  } }), 2)
+  let q = read(root)
+  assert.equal(q.groups[0].state, 'blocked'); assert.equal(q.groups[1].state, 'done')
+  assert.match(L.status(root), /Which value should be used/)
+  fs.mkdirSync(path.join(root, 'inbox'), { recursive: true })
+  fs.writeFileSync(path.join(root, 'inbox/answers.json'), JSON.stringify([{ id: q.questions[0].id, answer: 'Use the assigned value.' }]))
+  assert.equal(await L.run(root, { checks, agent: async args => {
+    assert.match(args.prompt, /Use the assigned value/)
+    return agent(args)
+  } }), 0)
+})
+
+test('queue authority refuses unregistered Markdown and missing required fields', () => {
+  const { root, q } = fixture([['a.txt']])
+  fs.writeFileSync(path.join(root, 'group-999.md'), '## Handwritten\n')
+  assert.throws(() => L.load(root), /Unregistered/)
+  for (const key of ['schema_version', 'request', 'authorization', 'integration_checks']) {
+    const broken = structuredClone(q); delete broken[key]
+    assert.throws(() => L.validate(broken, root), undefined, key)
+  }
+})
+
+test('native dispatch waits for exact stopped inbox result and never substitutes CLI', { timeout: 30000 }, async () => {
+  const { root } = fixture([['a.txt']], { task: { ...selection, kind: 'native' } })
+  let calls = 0
+  const noCli = async () => { calls++; throw Error('CLI substitution forbidden') }
+  assert.equal(await L.run(root, { checks, agent: noCli }), 2)
+  let q = read(root)
+  const handoff = q.handoffs[0]
+  assert.equal(calls, 0)
+  const assignment = fs.readFileSync(handoff.assignment, 'utf8')
+  assert.ok(assignment.includes(path.join(root, 'inbox', `${handoff.id}.json`)))
+  task_edit({ cwd: handoff.cwd, prompt: assignment })
+  fs.mkdirSync(path.join(root, 'inbox'), { recursive: true })
+  fs.writeFileSync(path.join(root, 'inbox', `${handoff.id}.json`), '{ malformed response')
+  assert.equal(await L.run(root, { checks, agent: noCli }), 2)
+  assert.equal(read(root).groups[0].state, 'native')
+  assert.equal(read(root).groups[0].attempt.id, handoff.id)
+  assert.equal(read(root).questions.length, 0)
+  assert.ok(read(root).handoffs[0].error)
+  fs.writeFileSync(path.join(root, 'inbox', `${handoff.id}.json`), JSON.stringify({ ...result({ id: handoff.id }), writer_stopped: false }))
+  assert.equal(await L.run(root, { checks, agent: noCli }), 2)
+  assert.equal(read(root).groups[0].state, 'native')
+  assert.equal(read(root).questions.length, 0)
+  assert.match(L.status(root), /Native host must prove worker and descendants stopped/)
+  assert.equal(calls, 0)
+})
+
+test('live queue and target claims refuse competing coordinators', { timeout: 30000 }, async () => {
+  const { root, repo, q } = fixture([['a.txt']])
+  const entered = deferred(), release = deferred()
+  const running = L.run(root, { checks, agent: async args => { entered.resolve(); await release.promise; return agent(args) } })
+  await entered.promise
+  await assert.rejects(L.run(root, { agent, checks }), /alive|claim|owned/i)
+  const other = path.join(path.dirname(root), 'other'); fs.mkdirSync(other)
+  fs.copyFileSync(path.join(root, q.groups[0].file), path.join(other, q.groups[0].file))
+  fs.copyFileSync(path.join(root, q.request), path.join(other, q.request))
+  write(other, { ...q, run_id: 'other', repo })
+  await assert.rejects(L.run(other, { agent, checks }), /alive|claim|owned/i)
+  release.resolve(); assert.equal(await running, 0)
+})
+
+test('external forward target movement integrates once and preserves owner ancestry', { timeout: 30000 }, async () => {
+  const { root, repo } = fixture([['a.txt']])
+  let moved
+  assert.equal(await L.run(root, { checks, agent: async args => {
+    fs.writeFileSync(path.join(repo, 'outside.txt'), 'owner commit\n')
+    git(repo, 'add', 'outside.txt'); git(repo, 'commit', '-m', 'outside lane')
+    moved = git(repo, 'rev-parse', 'HEAD')
+    return agent(args)
+  } }), 0)
+  assert.equal(git(repo, 'merge-base', moved, 'HEAD'), moved)
+  assert.equal(read(root).groups[0].state, 'done')
+  assert.equal(read(root).target_adoptions.length, 1)
+})
+
+test('simultaneously observed readiness uses group ID order and serial verified bases', { timeout: 30000 }, async () => {
+  const { root } = fixture([['a.txt'], ['b.txt']])
+  const gate = deferred()
+  let waiting = 0
+  const landings = []
+  assert.equal(await L.run(root, { agent, checks: async args => {
+    if (!path.basename(args.cwd).startsWith('aglite-merge-')) {
+      waiting++
+      if (waiting === 2) gate.resolve()
+      await gate.promise
+    }
+    return checks(args)
+  }, on_save: q => {
+    if (q.integration?.phase === 'landing' && !landings.some(x => x.group_id === q.integration.group_id)) landings.push(structuredClone(q.integration))
+  } }), 0)
+  assert.deepEqual(landings.map(x => x.group_id), ['G1', 'G2'])
+  assert.equal(landings[1].base, landings[0].result)
+})
+
+test('checked landed crash image recovers once; missing checked proof cannot complete', { timeout: 30000 }, async () => {
+  const { root, repo } = fixture([['a.txt']])
+  let crashImage
+  assert.equal(await L.run(root, { agent, checks, on_save: q => {
+    if (q.integration?.phase === 'landing' && !crashImage) {
+      crashImage = structuredClone(q)
+      git(repo, 'merge', '--ff-only', q.integration.result)
+      throw Error('Injected coordinator crash after target fast-forward')
+    }
+  } }), 2)
+  const landed = git(repo, 'rev-parse', 'HEAD')
+  const count = git(repo, 'rev-list', '--count', 'HEAD')
+  assert.equal(crashImage.integration.result, landed)
+  // Restore exactly the durable state preceding the actual fast-forward, while
+  // retaining the landed Git effect: the crash window's two independent stores.
+  write(root, crashImage)
+  let workers = 0
+  assert.equal(await L.run(root, { agent: async () => { workers++; throw Error('duplicate work') }, checks }), 0)
+  assert.equal(workers, 0)
+  assert.equal(git(repo, 'rev-list', '--count', 'HEAD'), count)
+  assert.equal(git(repo, 'rev-parse', 'HEAD'), landed)
+  const unproved = structuredClone(crashImage)
+  delete unproved.integration.checks
+  write(root, unproved)
+  await assert.rejects(L.run(root, { agent, checks }), /lacks checked evidence/)
+  assert.notEqual(read(root).groups[0].state, 'done')
+})
+
+test('failed combined check requires repair, fresh checks, review, then acceptance', { timeout: 30000 }, async () => {
+  const { root, repo } = fixture([['a.txt']], { repair: selection, acceptance: { ...selection, provider: 'claude', model: 'test-counterpart' } })
   const events = []
-  const result = await run_looper(base_options(fixture.queue, fixture.fake_child, { launch_log }, {
-    on_event: ({ event }) => events.push(event),
-  }))
-  assert.notEqual(result.code, 0)
-  assert.match(result.message, /completed|human review|incomplete|archive|identity/i)
-  assert.deepEqual(result.launched, [])
-  assert.deepEqual(read_json_lines(launch_log), [])
-  assert.equal(fs.existsSync(path.join(fixture.queue, 'plan-002.md')), true)
-  assert.equal(fs.existsSync(path.join(fixture.queue, 'done', 'plan-002.md')), false)
-  assert.deepEqual(fs.readFileSync(attempt_path(fixture.queue)), fixture.before)
-  assert.deepEqual(events.filter((event) => event === 'ownership-acquired' || event === 'ownership-released'), [])
-}
-
-const is_within = (candidate, parent) => {
-  const relative = path.relative(path.resolve(parent), path.resolve(candidate))
-  return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative))
-}
-
-const base_options = (queue, fake_child, config = {}, overrides = {}) => ({
-  tasks_dir: queue,
-  state_root: test_state_root,
-  completion_path,
-  executable: process.execPath,
-  build_args: ({ task, plan_path, prompt }) => [fake_child, JSON.stringify({
-    mode: 'success',
-    ...config,
-    marker: completion_line,
-    task,
-    plan_path,
-    prompt,
-    tasks_dir: queue,
-  })],
-  silent: true,
-  verify_notebook_round: false,
-  ...overrides,
+  let failed = false
+  assert.equal(await L.run(root, { agent: async args => {
+    fs.mkdirSync(args.attempt_dir, { recursive: true })
+    events.push(args.role)
+    assert.ok(args.prompt.includes(`read inherited configuration only at ${path.join(args.cwd, '.agentflow/ag.json')}`))
+    assert.ok(args.prompt.includes('No configuration discovery, creation, migration writes, release checks or project adoption'))
+    if (['review', 'acceptance'].includes(args.role)) assert.ok(args.prompt.includes('against original request Implement every registered task while preserving owner content.. Base '))
+    if (args.role === 'task') task_edit(args)
+    if (args.role === 'repair') fs.writeFileSync(path.join(args.cwd, 'a.txt'), 'repaired\n')
+    return result(args.attempt)
+  }, checks: async args => {
+    const combined = path.basename(args.cwd).startsWith('aglite-merge-')
+    events.push(combined ? 'combined-checks' : 'task-checks')
+    if (combined && !failed) { failed = true; return args.ids.map(id => ({ id, passed: false })) }
+    return checks(args)
+  } }), 0)
+  assert.deepEqual(events, ['task', 'task-checks', 'combined-checks', 'repair', 'combined-checks', 'review', 'acceptance'])
+  assert.equal(fs.readFileSync(path.join(repo, 'a.txt'), 'utf8'), 'repaired\n')
 })
 
-test('help is accepted and describes installation, progress, and recovery', () => {
-  assert.equal(parse_cli(['--help']).help, true)
-  assert.equal(parse_cli(['-h']).help, true)
-  assert.match(HELP, /Usage: agf-looper/)
-  assert.match(HELP, /setup\.js --fix/)
-  assert.match(HELP, /planned\/done/)
-  assert.match(HELP, /--dump/)
-  assert.equal(parse_cli(['--dump']).dump, true)
-  assert.equal(parse_cli([]).dump, undefined)
+for (const verdict of ['pass', 'blocked']) test(`same-provider fresh repaired review ${verdict} retains integration safeguards`, { timeout: 30000 }, async () => {
+  const { root, repo } = fixture([['a.txt']], { repair: selection, acceptance: selection })
+  const attempts = []
+  let fail = true
+  const code = await L.run(root, { agent: async args => {
+    fs.mkdirSync(args.attempt_dir, { recursive: true })
+    attempts.push({ role: args.role, id: args.attempt.id })
+    if (args.role === 'task') task_edit(args)
+    if (args.role === 'repair') fs.writeFileSync(path.join(args.cwd, 'a.txt'), 'repaired\n')
+    return result(args.attempt, args.role === 'review' ? verdict : 'pass')
+  }, checks: async args => {
+    if (path.basename(args.cwd).startsWith('aglite-merge-') && fail) {
+      fail = false
+      return args.ids.map(id => ({ id, passed: false }))
+    }
+    return checks(args)
+  } })
+  const roles = attempts.map(x => x.role)
+  assert.equal(new Set(attempts.map(x => x.id)).size, attempts.length)
+  assert.equal(code, verdict === 'pass' ? 0 : 2)
+  assert.deepEqual(roles, verdict === 'pass'
+    ? ['task', 'repair', 'review', 'acceptance'] : ['task', 'repair', 'review'])
+  assert.equal(fs.existsSync(path.join(repo, 'a.txt')), verdict === 'pass')
+  assert.equal(read(root).groups[0].state, verdict === 'pass' ? 'done' : 'blocked')
 })
 
-test('queue view shows completed, active, failed, and pending plans with current progress', () => {
-  const queue = make_queue()
-  try {
-    write_plan(path.join(queue, 'done'), 'plan-001.md')
-    write_plan(queue, 'plan-002.md')
-    write_plan(queue, 'plan-003.md')
-    const context = { tasks_dir: queue, done_dir: path.join(queue, 'done'), file_system: fs }
-    assert.deepEqual(queue_view(context, 'plan-002.md').lines, [
-      'Progress: 2/3',
-      '[x] plan-001.md',
-      '[*] plan-002.md',
-      '[ ] plan-003.md',
-    ])
-    assert.equal(queue_view(context, null, 'plan-002.md').lines[2], '[-] plan-002.md')
-  } finally {
-    remove_temp_dir(queue)
+test('stopped blocked repair preserves its attempt and other ready groups integrate', { timeout: 30000 }, async () => {
+  const { root, repo } = fixture([['a.txt'], ['b.txt']], { repair: selection, acceptance: { ...selection, provider: 'claude', model: 'test-counterpart' } })
+  let failed = false
+  assert.equal(await L.run(root, { agent: async args => {
+    if (args.role === 'repair') return result(args.attempt, 'needs_owner')
+    return agent(args)
+  }, checks: async args => {
+    if (path.basename(args.cwd).startsWith('aglite-merge-fixture-G1-') && !failed) {
+      failed = true; return args.ids.map(id => ({ id, passed: false }))
+    }
+    return checks(args)
+  } }), 2)
+  const q = read(root)
+  assert.equal(q.groups[0].state, 'blocked')
+  assert.ok(fs.existsSync(q.groups[0].suspended_integration.worktree))
+  assert.equal(q.groups[1].state, 'done')
+  assert.equal(fs.readFileSync(path.join(repo, 'b.txt'), 'utf8'), 'G2/T2-1\n')
+  assert.equal(fs.existsSync(path.join(repo, 'a.txt')), false)
+})
+
+test('stopped native handoff resumes exact attempt through successful integration', { timeout: 30000 }, async () => {
+  const { root } = fixture([['a.txt']], { task: { ...selection, kind: 'native' } })
+  const forbidden = async () => { throw Error('Native selection cannot launch a CLI') }
+  assert.equal(await L.run(root, { agent: forbidden, checks }), 2)
+  const handoff = read(root).handoffs[0]
+  task_edit({ cwd: handoff.cwd, prompt: fs.readFileSync(handoff.assignment, 'utf8') })
+  fs.mkdirSync(path.join(root, 'inbox'), { recursive: true })
+  fs.writeFileSync(path.join(root, 'inbox', `${handoff.id}.json`), JSON.stringify({ ...result({ id: handoff.id }), writer_stopped: true }))
+  assert.equal(await L.run(root, { agent: forbidden, checks }), 0)
+  assert.equal(read(root).handoffs[0].completed, true)
+})
+
+test('ordinary closeout accepts arrowless Reply but requires a newly advanced round', () => {
+  const cwd = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'aglite-closeout-test-')))
+  fs.mkdirSync(path.join(cwd, '.aglite-records'))
+  const file = path.join(cwd, '.aglite-records/devlog.md')
+  fs.writeFileSync(file, '# → Ask / A-001\n\n# Reply / A-001\n\nCompleted.\n\n# → Ask / A-002\n')
+  assert.equal(L.ordinary_closeout(cwd, { previous_round: 0 }), 1)
+  assert.throws(() => L.ordinary_closeout(cwd, { previous_round: 1 }), /new Reply/)
+  fs.appendFileSync(file, '\n# Reply / A-002\n\nCompleted next task.\n\n# → Ask / A-003\n')
+  assert.equal(L.ordinary_closeout(cwd, { previous_round: 1 }), 2)
+  fs.writeFileSync(file, 'Quoted prior completion: # Reply / A-003\n\n# → Ask / A-004\n')
+  assert.throws(() => L.ordinary_closeout(cwd, { previous_round: 2 }), /new Reply/)
+})
+
+test('native outstanding assignments reserve max_workers until a stopped result is imported', { timeout: 30000 }, async () => {
+  const { root } = fixture([['a.txt'], ['b.txt'], ['c.txt']], { task: { ...selection, kind: 'native' }, max_workers: 2 })
+  const forbidden = async () => { throw Error('CLI substitution forbidden') }
+  assert.equal(await L.run(root, { agent: forbidden, checks }), 2)
+  let q = read(root)
+  assert.equal(q.handoffs.length, 2)
+  assert.equal(q.groups[2].state, 'pending')
+  assert.equal(q.groups[2].workspace, undefined)
+  // Merely resuming without any host result must not issue a third assignment.
+  assert.equal(await L.run(root, { agent: forbidden, checks }), 2)
+  assert.equal(read(root).handoffs.length, 2)
+  const handoff = q.handoffs[0]
+  task_edit({ cwd: handoff.cwd, prompt: fs.readFileSync(handoff.assignment, 'utf8') })
+  fs.mkdirSync(path.join(root, 'inbox'), { recursive: true })
+  fs.writeFileSync(path.join(root, 'inbox', `${handoff.id}.json`), JSON.stringify({ ...result({ id: handoff.id }), writer_stopped: true }))
+  assert.equal(await L.run(root, { agent: forbidden, checks }), 2)
+  q = read(root)
+  assert.equal(q.groups[0].state, 'done')
+  assert.equal(q.groups[2].state, 'native')
+  assert.equal(q.handoffs.filter(item => !item.completed).length, 2)
+})
+
+function answer(root, question, source) {
+  fs.mkdirSync(path.join(root, 'inbox'), { recursive: true })
+  fs.writeFileSync(path.join(root, 'inbox/answers.json'), JSON.stringify([{ id: question.id, answer: 'Correction supplied; continue.', source }]))
+}
+
+test('host corrects technical blocker and reuses exact stopped successful attempt', { timeout: 30000 }, async () => {
+  const { root } = fixture([['a.txt']])
+  let calls = 0, original
+  assert.equal(await L.run(root, { checks, agent: async args => {
+    calls++; original = args.attempt.id
+    fs.mkdirSync(args.attempt_dir, { recursive: true })
+    const response = result(args.attempt)
+    fs.writeFileSync(path.join(args.attempt_dir, 'exit.json'), JSON.stringify({ exit_code: 0, aborted: false, timed_out: false }))
+    fs.writeFileSync(path.join(args.attempt_dir, 'result.json'), JSON.stringify(response))
+    // Agent completed product work but its notebook needs a host technical fix.
+    fs.writeFileSync(path.join(args.cwd, 'a.txt'), 'completed product\n')
+    return response
+  } }), 2)
+  let q = read(root)
+  assert.equal(q.questions[0].requires_owner, false)
+  closeout(q.groups[0].workspace.worktree)
+  answer(root, q.questions[0], 'host')
+  assert.equal(await L.run(root, { checks, agent: async () => { calls++; throw Error('Completed attempt repeated') } }), 0)
+  q = read(root)
+  assert.equal(calls, 1)
+  assert.equal(q.groups[0].tasks[0].result.attempt_id, original)
+  assert.equal(q.questions[0].answer_source, 'host')
+})
+
+test('owner-only worker question rejects host source and accepts actual owner answer', { timeout: 30000 }, async () => {
+  const { root } = fixture([['a.txt']])
+  assert.equal(await L.run(root, { checks, agent: async args => result(args.attempt, 'needs_owner') }), 2)
+  const q = read(root)
+  assert.equal(q.questions[0].requires_owner, true)
+  answer(root, q.questions[0], 'host')
+  await assert.rejects(L.run(root, { agent, checks }), /actual owner answer/)
+  assert.equal(read(root).questions[0].answer, undefined)
+  answer(root, q.questions[0], 'owner')
+  assert.equal(await L.run(root, { agent, checks }), 0)
+  assert.equal(read(root).questions[0].answer_source, 'owner')
+})
+
+for (const unrelated of [false, true]) test(`task commit crash ${unrelated ? 'refuses unrelated commit identity' : 'resumes exact committed task without repeating worker'}`, { timeout: 30000 }, async () => {
+  const { root } = fixture([['a.txt']])
+  let image, calls = 0, committed
+  assert.equal(await L.run(root, { checks, agent: async args => { calls++; return agent(args) }, on_save: q => {
+    const group = q.groups[0], task = group.tasks[0]
+    if (task.commit_intent && !image) {
+      image = structuredClone(q)
+      const cwd = group.workspace.worktree
+      git(cwd, 'add', 'a.txt')
+      git(cwd, 'commit', '-m', unrelated ? 'unrelated owner commit' : task.commit_intent.message)
+      committed = git(cwd, 'rev-parse', 'HEAD')
+      throw Error('Injected crash after task product commit')
+    }
+  } }), 2)
+  assert.ok(image.groups[0].tasks[0].round === 1, 'ordinary closeout recorded before commit intent')
+  write(root, image)
+  const code = await L.run(root, { checks, agent: async () => { calls++; throw Error('Task worker repeated') } })
+  assert.equal(calls, 1)
+  const q = read(root)
+  if (unrelated) {
+    assert.equal(code, 2)
+    assert.match(q.questions.at(-1).question, /commit identity is uncertain/)
+    assert.notEqual(q.groups[0].state, 'done')
+  } else {
+    assert.equal(code, 0)
+    assert.equal(q.groups[0].tasks[0].candidate, committed)
+    assert.equal(q.groups[0].tasks[0].checks_result[0].passed, true)
   }
 })
 
-test('visible mode stays quiet while it prints startup and plan progress', async () => {
-  const dir = make_temp_dir('agentflow-looper-visible')
-  try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    write_plan(queue, 'plan-001.md')
-    const stdout = []
-    const stderr = []
-    const stream = target => ({ write: chunk => target.push(String(chunk)) })
-    const result = await run_looper(base_options(queue, fake_child, { mode: 'both-output' }, {
-      silent: false,
-      stdout: stream(stdout),
-      stderr: stream(stderr),
-    }))
-    assert.equal(result.code, 0)
-    assert.match(stderr.join(''), /Working directory:/)
-    assert.match(stderr.join(''), /Progress: 0\/1/)
-    assert.match(stderr.join(''), /Starting 1\/1 — plan-001\.md/)
-    assert.match(stderr.join(''), /Worker: model\/effort use CLI defaults/)
-    assert.match(stderr.join(''), /Completed 1\/1 — plan-001\.md/)
-    assert.doesNotMatch(stdout.join(''), /arbitrary stdout/)
-    assert.doesNotMatch(stderr.join(''), /arbitrary stderr/)
-  } finally {
-    remove_temp_dir(dir)
-  }
+test('next task cannot reuse the prior arrowless ordinary Reply', { timeout: 30000 }, async () => {
+  const { root } = fixture([['a.txt', 'b.txt']])
+  let calls = 0
+  assert.equal(await L.run(root, { checks, agent: async args => {
+    calls++
+    if (calls === 1) {
+      const response = await agent(args)
+      const file = path.join(args.cwd, '.aglite-records/devlog.md')
+      fs.writeFileSync(file, fs.readFileSync(file, 'utf8').replace('# → Reply / A-001', '# Reply / A-001'))
+      return response
+    }
+    fs.writeFileSync(path.join(args.cwd, 'b.txt'), 'second task edits without closeout\n')
+    return result(args.attempt)
+  } }), 2)
+  const q = read(root)
+  assert.equal(q.groups[0].tasks[0].state, 'done')
+  assert.notEqual(q.groups[0].tasks[1].state, 'done')
+  assert.match(q.questions[0].question, /new Reply/)
 })
 
-test('configured implementation model and effort are shown and passed to Codex', async (t) => {
-  const dir = make_temp_dir('agentflow-looper-model')
-  const queue = make_queue()
-  t.after(() => { remove_temp_dir(dir); remove_temp_dir(queue) })
-  const fake_child = make_fake_child(dir)
-  write_plan(queue, 'plan-001.md')
-  const stderr = []
-  const calls = []
-  const config = agentflow_settings.make_template('codex')
-  const result = await run_looper(base_options(queue, fake_child, {}, {
-    executable: undefined,
-    build_args: undefined,
-    worker_config: config,
-    executable_available: command => command === 'codex',
-    silent: false,
-    stderr: { write: chunk => stderr.push(String(chunk)) },
-    spawn: (executable, args, options) => {
-      calls.push({ executable, args })
-      fs.ftruncateSync(options.stdio[3], 0)
-      fs.writeSync(options.stdio[3], `${completion_line}\n`, 0, 'utf8')
-      return spawn(process.execPath, [fake_child, JSON.stringify({ mode: 'success', marker: completion_line })], { stdio: ['ignore', 'pipe', 'pipe'] })
-    },
-  }))
-  assert.equal(result.code, 0)
-  const selection = agentflow_settings.resolve_worker_tier(config, { role: 'implementation' }, {
-    executable_available: command => command === 'codex',
+test('killed coordinator after actual landing leaves dead claims that resume exactly once', { timeout: 30000 }, async () => {
+  const { root, repo } = fixture([['a.txt']])
+  const { spawn } = require('node:child_process')
+  const childSource = `
+    const fs = require('node:fs')
+    const path = require('node:path')
+    const { execFileSync } = require('node:child_process')
+    const L = require(${JSON.stringify(require.resolve('./looper'))})
+    const root = ${JSON.stringify(root)}
+    L.run(root, {
+      agent: async args => {
+        fs.mkdirSync(args.attempt_dir, { recursive: true })
+        fs.writeFileSync(path.join(args.cwd, 'a.txt'), 'child completed product\\n')
+        fs.writeFileSync(path.join(args.cwd, '.aglite-records/devlog.md'), '# → Ask / A-001\\n')
+        fs.appendFileSync(path.join(args.cwd, '.aglite-records/devlog.md'), '\\n# Reply / A-001\\n\\nCompleted.\\n\\n# → Ask / A-002\\n')
+        return { attempt_id: args.attempt.id, outcome: 'pass', summary: 'Completed.', evidence: [] }
+      },
+      checks: async ({ ids }) => ids.map(id => ({ id, passed: true })),
+      on_save: q => {
+        if (q.integration?.phase === 'landing') {
+          execFileSync('git', ['merge', '--ff-only', q.integration.result], { cwd: q.repo, stdio: 'pipe' })
+          process.kill(process.pid, 'SIGKILL')
+        }
+      }
+    }).catch(error => { console.error(error); process.exitCode = 1 })
+  `
+  const child = spawn(process.execPath, ['-e', childSource], { stdio: ['ignore', 'pipe', 'pipe'] })
+  let stderr = ''
+  child.stderr.on('data', data => { stderr += data })
+  const death = await new Promise((resolve, reject) => {
+    child.once('error', reject)
+    child.once('close', (code, signal) => resolve({ code, signal }))
   })
-  assert.match(stderr.join(''), new RegExp(`Worker: ${selection.model}/${selection.effort}`))
-  assert.deepEqual(calls[0].args.slice(0, 5), [
-    'exec',
-    '-m', selection.model,
-    '-c', `model_reasoning_effort=${selection.effort}`,
-  ])
+  if (process.platform === 'win32') assert.notEqual(death.code, 0, stderr)
+  else {
+    assert.equal(death.signal, 'SIGKILL', stderr)
+    assert.equal(death.code, null)
+  }
+  assert.throws(() => process.kill(child.pid, 0), { code: 'ESRCH' })
+  const interrupted = read(root)
+  assert.equal(interrupted.integration.phase, 'landing')
+  const landed = interrupted.integration.result
+  assert.equal(git(repo, 'rev-parse', 'HEAD'), landed)
+  const count = git(repo, 'rev-list', '--count', 'HEAD')
+  assert.ok(fs.existsSync(path.join(root, '.queue.owner')))
+  const common = path.resolve(repo, git(repo, 'rev-parse', '--git-common-dir'))
+  assert.equal(fs.readdirSync(common).filter(name => /^aglite-target-.*\.owner$/.test(name)).length, 1)
+  let calls = 0
+  assert.equal(await L.run(root, { checks, agent: async () => { calls++; throw Error('Killed landed worker repeated') } }), 0)
+  assert.equal(calls, 0)
+  assert.equal(git(repo, 'rev-parse', 'HEAD'), landed)
+  assert.equal(git(repo, 'rev-list', '--count', 'HEAD'), count)
+  assert.equal(read(root).groups[0].state, 'done')
+  assert.equal(fs.existsSync(path.join(root, '.queue.owner')), false)
+  assert.equal(fs.readdirSync(common).filter(name => /^aglite-target-.*\.owner$/.test(name)).length, 0)
 })
 
-test('a running plan periodically shows elapsed time and bounded latest worker detail, then stops its timer', async () => {
-  const dir = make_temp_dir('agentflow-looper-milestone')
-  try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    write_plan(queue, 'plan-001.md')
-    const stderr = []
-    const detail = 'x'.repeat(300)
-    const result = await run_looper(base_options(queue, fake_child, {
-      mode: 'slow-output',
-      output: detail,
-      // Leave several progress polls after child startup even on a loaded full-suite run.
-      delay: 500,
-    }, {
-      silent: false,
-      milestone_interval_ms: 15,
-      stderr: { write: chunk => stderr.push(String(chunk)) },
-    }))
-    assert.equal(result.code, 0)
-    const completed_output = stderr.join('')
-    assert.match(completed_output, /Still running — plan-001\.md — \d+s elapsed — latest: x+/)
-    assert.doesNotMatch(completed_output, new RegExp('x'.repeat(241)))
-    await new Promise(resolve => setTimeout(resolve, 35))
-    assert.equal(stderr.join(''), completed_output)
-  } finally {
-    remove_temp_dir(dir)
+test('Claude JSON envelopes require one final successful structured result', () => {
+  const { parse_claude_result } = require('./looper-agent')
+  const output = { attempt_id: 'exact-attempt', outcome: 'pass', summary: 'Checked.', evidence: [] }
+  const final = { type: 'result', subtype: 'success', is_error: false, structured_output: output }
+  const assistant = { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Read' }] } }
+  assert.deepEqual(parse_claude_result(JSON.stringify(final)), output)
+  assert.deepEqual(parse_claude_result(JSON.stringify([assistant, { type: 'tool_result' }, final])), output)
+  for (const envelope of [[assistant], [final, final], [final, assistant], { ...final, is_error: true }, { ...final, subtype: 'error_during_execution' }, { ...final, structured_output: undefined }]) {
+    assert.throws(() => parse_claude_result(JSON.stringify(envelope)), /failed or ambiguous/)
   }
 })
 
-test('show-output pages bounded worker details without streaming them normally', async () => {
-  const dir = make_temp_dir('agentflow-looper-page-output')
-  try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    write_plan(queue, 'plan-001.md')
-    const pages = []
-    const result = await run_looper(base_options(queue, fake_child, { mode: 'both-output' }, {
-      show_output: true,
-      page_output: page => pages.push(page),
-    }))
-    assert.equal(result.code, 0)
-    assert.equal(pages.length, 1)
-    assert.equal(pages[0].task, 'plan-001.md')
-    assert.match(pages[0].output, /arbitrary stdout/)
-    assert.match(pages[0].output, /arbitrary stderr/)
-  } finally {
-    remove_temp_dir(dir)
-  }
-})
-
-test('dump saves complete stdout and stderr while default mode writes no dump', async () => {
-  const dir = make_temp_dir('agentflow-looper-dump')
-  try {
-    const root = fs.realpathSync(dir)
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    write_plan(queue, 'plan-001.md')
-    write_plan(queue, 'plan-002.md')
-    const dump_dir = path.join(root, 'artifacts', 'looper-output', 'test-run')
-    const result = await run_looper(base_options(queue, fake_child, { mode: 'both-output' }, { root, dump: true, dump_dir }))
-    assert.equal(result.code, 0, result.message)
-    assert.equal(fs.readFileSync(path.join(dump_dir, 'plan-001.stdout.log'), 'utf8'), 'arbitrary stdout\n')
-    assert.equal(fs.readFileSync(path.join(dump_dir, 'plan-001.stderr.log'), 'utf8'), `arbitrary stderr\n${completion_line}\n`)
-    assert.equal(fs.readFileSync(path.join(dump_dir, 'plan-002.stdout.log'), 'utf8'), 'arbitrary stdout\n')
-    assert.equal(fs.readFileSync(path.join(dump_dir, 'plan-002.stderr.log'), 'utf8'), `arbitrary stderr\n${completion_line}\n`)
-
-    const second_queue = make_queue()
-    write_plan(second_queue, 'plan-001.md')
-    const no_dump = path.join(root, 'no-dump')
-    const default_result = await run_looper(base_options(second_queue, fake_child, { mode: 'both-output' }, { root, dump_dir: no_dump }))
-    assert.equal(default_result.code, 0)
-    assert.equal(fs.existsSync(no_dump), false)
-
-    const failed_queue = make_queue()
-    write_plan(failed_queue, 'plan-001.md')
-    const failed_dump = path.join(root, 'artifacts', 'looper-output', 'failed-dump')
-    const failed_result = await run_looper(base_options(failed_queue, fake_child, { mode: 'prefix-suffix' }, { root, dump: true, dump_dir: failed_dump }))
-    assert.notEqual(failed_result.code, 0)
-    assert.equal(fs.readFileSync(path.join(failed_dump, 'plan-001.stdout.log'), 'utf8'), `prefix ${completion_line} suffix\n`)
-  } finally {
-    remove_temp_dir(dir)
-  }
-})
-
-test('dump writes every byte across short writes and rejects zero progress', () => {
-  const written = []
-  const partial_file_system = {
-    writeSync: (_descriptor, buffer, offset, length) => {
-      const count = Math.min(2, length)
-      written.push(buffer.subarray(offset, offset + count))
-      return count
-    },
-  }
-  write_all_sync(partial_file_system, 1, Buffer.from('complete output'))
-  assert.equal(Buffer.concat(written).toString('utf8'), 'complete output')
-  assert.throws(() => write_all_sync({ writeSync: () => 0 }, 1, Buffer.from('x')), /no valid write progress/)
-})
-
-test('dump refuses an outside or symlinked directory before the worker starts', async () => {
-  const dir = make_temp_dir('agentflow-looper-dump-boundary')
-  const outside = make_temp_dir('agentflow-looper-dump-outside')
-  try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    write_plan(queue, 'plan-001.md')
-    let starts = 0
-    const outside_result = await run_looper(base_options(queue, fake_child, {}, {
-      root: dir,
-      dump: true,
-      dump_dir: outside,
-      spawn: () => { starts += 1 },
-    }))
-    assert.notEqual(outside_result.code, 0)
-    assert.equal(starts, 0)
-
-    const second_queue = make_queue()
-    write_plan(second_queue, 'plan-001.md')
-    fs.mkdirSync(path.join(dir, 'artifacts'), { recursive: true })
-    fs.symlinkSync(outside, path.join(dir, 'artifacts', 'looper-output'))
-    const symlink_result = await run_looper(base_options(second_queue, fake_child, {}, {
-      root: dir,
-      dump: true,
-      spawn: () => { starts += 1 },
-    }))
-    assert.notEqual(symlink_result.code, 0)
-    assert.equal(starts, 0)
-    assert.equal(fs.readdirSync(outside).length, 0)
-  } finally {
-    remove_temp_dir(dir)
-    remove_temp_dir(outside)
-  }
-})
-
-test('failure result gives a concrete review checklist and paths', async () => {
-  const dir = make_temp_dir('agentflow-looper-recovery-message')
-  try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    write_plan(queue, 'plan-001.md')
-    const result = await run_looper(base_options(queue, fake_child, { mode: 'no-marker' }))
-    assert.notEqual(result.code, 0)
-    assert.match(result.message, /What to do next:/)
-    assert.match(result.message, /\.stop\.txt/)
-    assert.match(result.message, /\.looper-attempt\.json/)
-    assert.match(result.message, /move that reviewed plan/)
-  } finally {
-    remove_temp_dir(dir)
-  }
-})
-
-test('nested worker violations preserve the plan and produce a recovery warning', { skip: process.platform === 'win32' ? 'Windows has no process table to scan for nested workers' : false }, async () => {
-  const dir = make_temp_dir('agentflow-looper-nested-worker')
-  const queue = make_queue()
-  const nested_executable = path.join(dir, 'codex')
-  fs.symlinkSync(process.execPath, nested_executable)
-  try {
-    const fake_child = make_fake_child(dir)
-    write_plan(queue, 'plan-001.md')
-    const result = await run_looper(base_options(queue, fake_child, { mode: 'nested', nested_executable }, { nested_poll_ms: 20 }))
-    assert.notEqual(result.code, 0)
-    assert.match(result.message, /nested worker|quarantined|fresh coordinator-controlled review/i)
-    assert.equal(fs.existsSync(path.join(queue, 'plan-001.md')), true)
-    assert.equal(fs.existsSync(path.join(queue, 'done', 'plan-001.md')), false)
-    const attempt = JSON.parse(fs.readFileSync(attempt_path(queue), 'utf8'))
-    assert.equal(attempt.nested_worker.detected, true)
-    assert.equal(attempt.nested_worker.recovery.evidence_status, 'quarantined')
-    assert.equal(attempt.nested_worker.processes.some(process_info => process_info.executable === nested_executable), true)
-  } finally {
-    remove_temp_dir(dir)
-    remove_temp_dir(queue)
-  }
-})
-
-test('default launch selects and preserves the literal external-workers command', async (t) => {
-  const dir = make_temp_dir('agentflow-looper-worker-profile')
-  const queue = make_queue()
-  t.after(() => { remove_temp_dir(dir); remove_temp_dir(queue) })
-  const fake_child = make_fake_child(dir)
-  write_plan(queue, 'plan-001.md')
-  const calls = []
-  const config = {
-    switches: { 'cli-provider': 'on' },
-    'external-workers': [
-      { id: 'lower', command: ['unused-worker', '--quiet'], priority: 2, family: 'unused' },
-      { id: 'chosen', command: ['claude', '-p', '--literal-flag'], priority: 5, family: 'claude', tiers: { basic: 'fixture/low' } },
-    ],
-  }
-  const result = await run_looper(base_options(queue, fake_child, {}, {
-    executable: undefined,
-    build_args: undefined,
-    worker_config: config,
-    executable_available: command => command === 'claude',
-    spawn: (executable, args) => {
-      calls.push({ executable, args })
-      return spawn(process.execPath, [fake_child, JSON.stringify({ mode: 'success', marker: completion_line })], { stdio: ['ignore', 'pipe', 'pipe'] })
-    },
-  }))
-  assert.equal(result.code, 0)
-  assert.equal(calls[0].executable, 'claude')
-  assert.deepEqual(calls[0].args.slice(0, 2), ['-p', '--literal-flag'])
-  assert.match(calls[0].args.at(-1), /^Execute the frozen plan directly: /)
-  assert.match(calls[0].args.at(-1), /already launched by agf-looper/i)
-  assert.match(calls[0].args.at(-1), /execute the named plan directly/i)
-  assert.match(calls[0].args.at(-1), /do not invoke agf-looper/i)
-  assert.match(calls[0].args.at(-1), /complete the Agentflow notebook record/i)
-  assert.match(calls[0].args.at(-1), /# ← Reply \/ A-NNN/)
-  assert.match(calls[0].args.at(-1), /# → Ask \/ A-NNN/)
-  assert.match(calls[0].args.at(-1), /bare plus line/i)
-  assert.match(calls[0].args.at(-1), /without the Reply heading/i)
-  assert.match(calls[0].args.at(-1), /entire final response must be exactly/i)
-  assert.match(calls[0].args.at(-1), new RegExp(completion_line.replace('.', '\\.')))
-})
-
-const run_case = async (config = {}, overrides = {}) => {
-  const dir = make_temp_dir('agentflow-looper-case')
-  const queue = path.join(dir, 'queue')
-  fs.mkdirSync(queue)
-  fs.mkdirSync(path.join(queue, 'done'))
-  const fake_child = make_fake_child(dir)
-  const launch_log = path.join(dir, 'launch.jsonl')
-  const result = await run_looper(base_options(queue, fake_child, {
-    ...config,
-    launch_log,
-  }, overrides))
-  return { dir, queue, fake_child, launch_log, result }
-}
-
-test('queue discovery is exact, numeric, fresh, and ignores control files', async () => {
-  const dir = make_temp_dir('agentflow-looper-order')
-  try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    const launch_log = path.join(dir, 'launch.jsonl')
-    write_plan(queue, 'plan-010.md')
-    write_plan(queue, 'plan-002.md')
-    write_plan(queue, 'plan-001.md')
-    for (const name of ['plan-1.md', 'plan-0000.md', 'plan-001.txt', 'notes-plan-003.md', '.looper-temp.json'])
-      fs.writeFileSync(path.join(queue, name), 'ignore\n')
-    write_plan(path.join(queue, 'done'), 'plan-999.md', 'already done')
-
-    const result = await run_looper(base_options(queue, fake_child, { launch_log }))
-
-    assert.equal(result.code, 0)
-    assert.deepEqual(read_json_lines(launch_log).map((entry) => entry.task), ['plan-001.md', 'plan-002.md', 'plan-010.md'])
-    assert.notEqual(read_json_lines(launch_log)[0].pid, read_json_lines(launch_log)[1].pid)
-    for (const name of ['plan-001.md', 'plan-002.md', 'plan-010.md']) assert.ok(fs.existsSync(path.join(queue, 'done', name)))
-    assert.ok(fs.existsSync(path.join(queue, 'plan-1.md')))
-  } finally {
-    remove_temp_dir(dir)
-  }
-})
-
-test('a generated queue derives completion and dependency authority from its frozen envelope', async () => {
-  const dir = make_temp_dir('agentflow-looper-generated')
-  try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    const launch_log = path.join(dir, 'launch.jsonl')
-    write_generated_queue(queue)
-
-    const result = await run_looper(base_options(queue, fake_child, { launch_log }, {
-      completion_path: undefined,
-      build_args: ({ task, plan_path, prompt }) => [fake_child, JSON.stringify({
-        mode: 'success', marker: 'records/work.devlog.md updated', task, plan_path, prompt, launch_log,
-      })],
-    }))
-
-    assert.equal(result.code, 0)
-    assert.deepEqual(result.launched, ['plan-001.md', 'plan-002.md', 'plan-003.md'])
-    assert.deepEqual(read_json_lines(launch_log).map(entry => entry.task), result.launched)
-    assert.match(read_json_lines(launch_log)[0].prompt, /owned by looper/i)
-    assert.match(read_json_lines(launch_log)[0].prompt, /do not move, rename, delete, or archive/i)
-    for (const name of result.launched) assert.ok(fs.existsSync(path.join(queue, 'done', name)))
-    assert.equal(fs.existsSync(path.join(queue, queue_contract.ENVELOPE_NAME)), true)
-    assert.equal(queue_contract.validate_frozen_queue(queue).valid, true)
-  } finally {
-    remove_temp_dir(dir)
-  }
-})
-
-test('incomplete generated plans refuse the handwritten fallback before launch', async () => {
-  const dir = make_temp_dir('agentflow-looper-incomplete-generated')
-  try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    const launch_log = path.join(dir, 'launch.jsonl')
-    write_generated_queue(queue)
-    fs.unlinkSync(path.join(queue, queue_contract.ENVELOPE_NAME))
-    const result = await run_looper(base_options(queue, fake_child, { launch_log }))
-    assert.notEqual(result.code, 0)
-    assert.match(result.message, /generated|authority|envelope/i)
-    assert.deepEqual(read_json_lines(launch_log), [])
-    remove_temp_dir(queue)
-  } finally {
-    remove_temp_dir(dir)
-  }
-})
-
-test('a generated stream queue derives its worker configuration from the envelope completion path', async () => {
-  const dir = make_temp_dir('agentflow-looper-generated-stream-config')
-  try {
-    const queue = path.join(dir, 'artifacts', 'stream', 'planned')
-    fs.mkdirSync(path.join(queue, 'done'), { recursive: true })
-	const fake_child = make_fake_child(dir)
-	write_generated_queue(queue, { completion_path: 'artifacts/stream/devlog.md' })
-	const config = command => {
-		const value = agentflow_settings.make_template('codex')
-		value.switches['allow-ag'] = 'on'
-		value['external-workers'] = [{
-			...value['external-workers'].find(profile => profile.family === 'claude'),
-        id: command,
-        command: ['claude', '-p', '--profile', command],
-        priority: 1,
-        family: 'claude',
-      }]
-      return JSON.stringify(value)
+for (const outcome of ['blocked', 'needs_owner']) test(`repair review ${outcome} preserves stage and safely retries ${outcome === 'blocked' ? 'same base' : 'after another ready group lands'}`, { timeout: 30000 }, async () => {
+  const groups = outcome === 'blocked' ? [['a.txt']] : [['a.txt'], ['b.txt']]
+  const { root, repo } = fixture(groups, { repair: selection, acceptance: { ...selection, provider: 'claude', model: 'test-counterpart' } })
+  const reviews = [], repairs = []
+  let stopReview = true
+  const reviewAgent = async args => {
+    if (args.role === 'task') return agent(args)
+    fs.mkdirSync(args.attempt_dir, { recursive: true })
+    if (!stopReview) {
+      assert.equal(args.prompt.split('Resolved answers/corrections (').length - 1, 1)
+      assert.match(args.prompt, /Correction supplied; continue/)
+      assert.match(args.prompt, new RegExp(`\"answer_source\":\"${outcome === 'blocked' ? 'host' : 'owner'}\"`))
+      assert.match(args.prompt, /host technical corrections grant no new scope/)
     }
-    fs.writeFileSync(path.join(dir, 'ag.json'), config('root-worker'))
-    fs.writeFileSync(path.join(dir, 'artifacts', 'stream', 'ag.json'), config('stream-worker'))
-    const calls = []
-
-    const result = await run_looper(base_options(queue, fake_child, {}, {
-      root: dir,
-      completion_path: undefined,
-      executable: undefined,
-      build_args: undefined,
-      executable_available: command => command === 'claude',
-      spawn: (executable, args, options) => {
-        calls.push({ executable, args })
-        return spawn(process.execPath, [fake_child, JSON.stringify({
-          mode: 'success', marker: 'artifacts/stream/devlog.md updated',
-        })], { stdio: ['ignore', 'pipe', 'pipe'] })
-      },
-    }))
-
-    assert.equal(result.code, 0)
-    assert.equal(calls.length, 3)
-    assert.deepEqual(calls.map(call => call.executable), ['claude', 'claude', 'claude'])
-    assert.ok(calls.every(call => call.args.includes('stream-worker') && !call.args.includes('root-worker')))
-  } finally {
-    remove_temp_dir(dir)
-  }
-})
-
-test('a generated queue refuses completion overrides and mutated or unbound plan bytes before launch', async (t) => {
-  for (const scenario of ['completion override', 'mutated plan', 'unbound plan']) {
-    await t.test(scenario, async () => {
-      const dir = make_temp_dir('agentflow-looper-generated-refusal')
-      try {
-        const queue = make_queue()
-        const fake_child = make_fake_child(dir)
-        const launch_log = path.join(dir, 'launch.jsonl')
-        write_generated_queue(queue)
-        const overrides = {}
-        if (scenario === 'completion override') overrides.completion_path = 'wrong.devlog.md'
-        if (scenario === 'mutated plan') fs.appendFileSync(path.join(queue, 'plan-002.md'), 'mutation\n')
-        if (scenario === 'unbound plan') write_plan(queue, 'plan-004.md', 'not in envelope')
-
-        const result = await run_looper(base_options(queue, fake_child, { launch_log }, overrides))
-
-        assert.notEqual(result.code, 0)
-        assert.match(result.message, /completion|frozen|digest|bound|queue|plan/i)
-        assert.deepEqual(result.launched, [])
-        assert.deepEqual(read_json_lines(launch_log), [])
-      } finally {
-        remove_temp_dir(dir)
-      }
-    })
-  }
-})
-
-test('a handwritten Codex queue binds completion to the final-message channel instead of its normal report', async () => {
-  const dir = make_temp_dir('agentflow-looper-handwritten-codex-final')
-  try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    write_plan(queue, 'plan-001.md')
-    write_plan(queue, 'plan-002.md')
-    write_plan(queue, 'plan-003.md')
-    const config = {
-      switches: { 'cli-provider': 'on' },
-      'external-workers': [
-        { id: 'codex-test', command: ['codex', 'exec'], priority: 1, family: 'codex' },
-      ],
+    if (args.role === 'repair') {
+      repairs.push(args.attempt.id)
+      fs.writeFileSync(path.join(args.cwd, 'a.txt'), 'repaired\n')
     }
-    const result = await run_looper(base_options(queue, fake_child, {}, {
-      executable: undefined,
-      build_args: undefined,
-      worker_config: config,
-      executable_available: command => command === 'codex',
-      spawn: (executable, args, options) => {
-        const output_index = args.indexOf('--output-last-message')
-        assert.equal(executable, 'codex')
-        assert.notEqual(output_index, -1)
-        assert_final_message_argument(args[output_index + 1])
-        fs.ftruncateSync(options.stdio[3], 0)
-        fs.writeSync(options.stdio[3], `${completion_line}\n`, 0, 'utf8')
-        return spawn(process.execPath, [fake_child, JSON.stringify({
-          mode: 'success', marker: 'ordinary human-readable report without the protocol marker',
-        })], { stdio: ['ignore', 'pipe', 'pipe'] })
-      },
-    }))
-
-    assert.equal(result.code, 0, result.message)
-    assert.deepEqual(result.launched, ['plan-001.md', 'plan-002.md', 'plan-003.md'])
-  } finally {
-    remove_temp_dir(dir)
-  }
-})
-
-test('a generated Codex queue binds completion to the final-message channel instead of streamed duplicates', async () => {
-  const dir = make_temp_dir('agentflow-looper-generated-codex-final')
-  try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    write_generated_queue(queue)
-    const config = {
-      switches: { 'cli-provider': 'on' },
-      'external-workers': [
-        { id: 'codex-test', command: ['codex', 'exec'], priority: 1, family: 'codex' },
-      ],
+    if (args.role === 'review') {
+      reviews.push(args.attempt.id)
+      assert.match(args.prompt, /Coordinator-observed exact Git evidence: HEAD [a-f0-9]+/)
+      assert.match(args.prompt, /diff --git a\/a.txt b\/a.txt/)
+      assert.match(args.prompt, /Observed check output:/)
+      assert.ok(args.prompt.includes(git(args.cwd, 'rev-parse', 'HEAD')))
+      if (stopReview) return { ...result(args.attempt, outcome), summary: 'Review needs additional external evidence.' }
     }
-    const result = await run_looper(base_options(queue, fake_child, {}, {
-      completion_path: undefined,
-      executable: undefined,
-      build_args: undefined,
-      worker_config: config,
-      executable_available: command => command === 'codex',
-      spawn: (executable, args, options) => {
-        const output_index = args.indexOf('--output-last-message')
-        assert.equal(executable, 'codex')
-        assert.notEqual(output_index, -1)
-        assert_final_message_argument(args[output_index + 1])
-        fs.ftruncateSync(options.stdio[3], 0)
-        fs.writeSync(options.stdio[3], 'records/work.devlog.md updated\n', 0, 'utf8')
-        return spawn(process.execPath, [fake_child, JSON.stringify({
-          mode: 'duplicate', marker: 'records/work.devlog.md updated',
-        })], { stdio: ['ignore', 'pipe', 'pipe'] })
-      },
-    }))
+    return result(args.attempt)
+  }
+  const repairChecks = async args => args.ids.map(id => ({ id, passed: !path.basename(args.cwd).startsWith('aglite-merge-') || !fs.existsSync(path.join(args.cwd, 'a.txt')) || fs.readFileSync(path.join(args.cwd, 'a.txt'), 'utf8') === 'repaired\n' }))
+  assert.equal(await L.run(root, { agent: reviewAgent, checks: repairChecks }), 2)
+  let q = read(root)
+  const suspended = q.groups[0].suspended_integration
+  assert.equal(suspended.phase, 'review')
+  assert.equal(repairs.length, 1, 'unavailable proof must not trigger another code repair')
+  assert.equal(reviews.length, 1)
+  assert.equal(q.questions[0].requires_owner, outcome === 'needs_owner')
+  assert.equal(fs.readFileSync(path.join(suspended.worktree, 'a.txt'), 'utf8'), 'repaired\n')
+  if (outcome === 'needs_owner') {
+    assert.equal(q.groups[1].state, 'done', 'blocked read-only review releases the safe lane')
+    assert.notEqual(q.expected_head, suspended.base)
+    answer(root, q.questions[0], 'host')
+    await assert.rejects(L.run(root, { agent: reviewAgent, checks: repairChecks }), /actual owner answer/)
+  }
+  stopReview = false
+  answer(root, q.questions[0], outcome === 'blocked' ? 'host' : 'owner')
+  assert.equal(await L.run(root, { agent: reviewAgent, checks: repairChecks }), 0)
+  q = read(root)
+  assert.equal(reviews.length, 2)
+  assert.notEqual(reviews[0], reviews[1], 'retry uses a fresh read-only session')
+  if (outcome === 'blocked') {
+    assert.equal(q.groups[0].integration.id, suspended.id)
+    assert.equal(repairs.length, 1, 'same-base review retry preserves repaired product')
+  } else {
+    assert.notEqual(q.groups[0].integration.id, suspended.id)
+    assert.equal(repairs.length, 1, 'moved target carries the preserved checked repair forward')
+    assert.equal(fs.readFileSync(path.join(repo, 'b.txt'), 'utf8'), 'G2/T2-1\n')
+  }
+  assert.equal(fs.readFileSync(path.join(repo, 'a.txt'), 'utf8'), 'repaired\n')
+})
 
-    assert.equal(result.code, 0, result.message)
-    assert.deepEqual(result.launched, ['plan-001.md', 'plan-002.md', 'plan-003.md'])
-  } finally {
-    remove_temp_dir(dir)
+test('repair cannot commit unresolved conflict markers', { timeout: 30000 }, async () => {
+  const { root, repo } = fixture([['a.txt']], { repair: selection, acceptance: { ...selection, provider: 'claude', model: 'test-counterpart' } })
+  let initial = true
+  assert.equal(await L.run(root, { checks: async args => {
+    if (path.basename(args.cwd).startsWith('aglite-merge-') && initial) { initial = false; return args.ids.map(id => ({ id, passed: false })) }
+    return checks(args)
+  }, agent: async args => {
+    if (args.role === 'task') return agent(args)
+    if (args.role === 'repair') fs.writeFileSync(path.join(args.cwd, 'a.txt'), '<<<<<<< ours\nleft\n=======\nright\n>>>>>>> theirs\n')
+    return result(args.attempt)
+  } }), 2)
+  const q = read(root), attempt = q.groups[0].suspended_integration
+  assert.equal(q.groups[0].state, 'blocked')
+  assert.match(q.questions[0].question, /conflict|marker/i)
+  assert.equal(git(attempt.worktree, 'diff', '--cached', '--name-only'), '')
+  assert.equal(fs.existsSync(path.join(repo, 'a.txt')), false)
+})
+
+test('startup target movement is adopted before new task workspaces', { timeout: 30000 }, async () => {
+  const { root, repo } = fixture([['a.txt'], ['b.txt']])
+  fs.writeFileSync(path.join(repo, 'outside.txt'), 'owner change\n')
+  git(repo, 'add', 'outside.txt'); git(repo, 'commit', '-m', 'owner moved target')
+  const actual = git(repo, 'rev-parse', 'HEAD')
+  assert.equal(await L.run(root, { agent, checks }), 0)
+  const q = read(root)
+  assert.equal(q.lane_error, null)
+  assert.ok(q.groups.every(group => group.tasks.every(task => task.state === 'done')))
+  assert.ok(q.groups.every(group => group.state === 'done' && group.workspace.base === actual))
+  assert.equal(git(repo, 'merge-base', actual, 'HEAD'), actual)
+})
+
+test('PID reuse with a proved different start identity is stopped, without signaling it', () => {
+  const S = require('./looper-state')
+  const actual = S.process_identity(process.pid)
+  assert.ok(actual)
+  assert.equal(S.process_alive({ pid: process.pid, started_at: `${actual}-different` }), false)
+  assert.equal(S.process_alive({ pid: process.pid, started_at: actual }), true)
+})
+
+test('host technical correction rechecks exact saved candidate without rerunning worker', { timeout: 30000 }, async () => {
+  const { root } = fixture([['a.txt']])
+  let calls = 0, first = true
+  assert.equal(await L.run(root, { agent: async args => { calls++; return agent(args) }, checks: async args => {
+    if (first) { first = false; return args.ids.map(id => ({ id, passed: false })) }
+    return checks(args)
+  } }), 2)
+  let q = read(root)
+  const candidate = q.groups[0].tasks[0].candidate
+  assert.ok(candidate)
+  answer(root, q.questions[0], 'host')
+  assert.equal(await L.run(root, { agent: async () => { calls++; throw Error('Worker repeated after flaky check') }, checks }), 0)
+  q = read(root)
+  assert.equal(calls, 1)
+  assert.equal(q.groups[0].tasks[0].candidate, candidate)
+})
+
+test('unsettled writer stops subsequent dispatch and retains ownership claims', { timeout: 30000 }, async () => {
+  const { root } = fixture([['a.txt'], ['b.txt']], { max_workers: 1 })
+  let calls = 0
+  assert.equal(await L.run(root, { checks, agent: async () => {
+    calls++
+    const error = Error('Worker settlement uncertain'); error.unsettled = true; throw error
+  } }), 2)
+  const q = read(root)
+  assert.equal(calls, 1)
+  assert.equal(q.groups[1].workspace, undefined)
+  assert.equal(q.groups[1].state, 'pending')
+  assert.notEqual(q.groups[0].state, 'done')
+  assert.ok(fs.existsSync(path.join(root, '.queue.owner')))
+})
+
+for (const intent of [true, false]) test(`staged task ${intent ? 'coordinator commit intent recovers own index' : 'worker index without intent is refused'}`, { timeout: 30000 }, async () => {
+  const { root } = fixture([['a.txt']])
+  let image, calls = 0
+  const code = await L.run(root, { checks, agent: async args => {
+    calls++
+    const response = await agent(args)
+    if (!intent) git(args.cwd, 'add', 'a.txt')
+    return response
+  }, on_save: q => {
+    const group = q.groups[0], task = group.tasks[0]
+    if (intent && task.commit_intent && !image) {
+      image = structuredClone(q)
+      git(group.workspace.worktree, 'add', 'a.txt')
+      throw Error('Crash after coordinator staging')
+    }
+  } })
+  assert.equal(code, 2)
+  if (intent) {
+    write(root, image)
+    assert.equal(await L.run(root, { checks, agent: async () => { calls++; throw Error('Staged task worker repeated') } }), 0)
+    assert.equal(calls, 1)
+  } else {
+    assert.equal(read(root).groups[0].tasks[0].commit_intent, undefined)
+    assert.match(read(root).questions[0].question, /stag/i)
   }
 })
 
-test('a generated Codex queue rejects invalid anonymous final-message bytes', async (t) => {
-  for (const scenario of ['oversize', 'invalid-utf8', 'growth', 'truncation']) {
-    await t.test(scenario, async () => {
-      const dir = make_temp_dir(`agentflow-looper-generated-final-${scenario}`)
-      try {
-        const queue = make_queue()
-        const fake_child = make_fake_child(dir)
-        write_generated_queue(queue)
-        const config = {
-          switches: { 'cli-provider': 'on' },
-          'external-workers': [{ id: 'codex-test', command: ['codex', 'exec'], priority: 1, family: 'codex' }],
-        }
-        let output_descriptor = null
-        let read_mutated = false
-        const file_system = new Proxy(fs, {
-          get(target, property) {
-            if (property !== 'readSync') return target[property]
-            return (...args) => {
-              if (output_descriptor !== null && !read_mutated && (scenario === 'growth' || scenario === 'truncation')) {
-                read_mutated = true
-                if (scenario === 'growth') fs.writeSync(output_descriptor, 'x', 0, 'utf8')
-                else fs.ftruncateSync(output_descriptor, 0)
-              }
-              return fs.readSync(...args)
-            }
-          },
-        })
-        const result = await run_looper(base_options(queue, fake_child, {}, {
-          fs: file_system,
-          completion_path: undefined,
-          executable: undefined,
-          build_args: undefined,
-          worker_config: config,
-          executable_available: command => command === 'codex',
-          spawn: (_executable, args, options) => {
-            const output = args[args.indexOf('--output-last-message') + 1]
-            assert_final_message_argument(output)
-            output_descriptor = options.stdio[3]
-            fs.ftruncateSync(output_descriptor, 0)
-            if (scenario === 'oversize') {
-              fs.writeSync(output_descriptor, 'x'.repeat(8194), 0, 'utf8')
-            } else if (scenario === 'invalid-utf8') {
-              fs.writeSync(output_descriptor, Buffer.from([0xff]), 0, 1, 0)
-            } else {
-              fs.writeSync(output_descriptor, 'records/work.devlog.md updated\n', 0, 'utf8')
-            }
-            return spawn(process.execPath, [fake_child, JSON.stringify({
-              mode: 'success', marker: 'records/work.devlog.md updated',
-            })], { stdio: ['ignore', 'pipe', 'pipe'] })
-          },
-        }))
+test('owner answer cannot supersede uncertain native writer without stopped attestation', { timeout: 30000 }, async () => {
+  const { root } = fixture([['a.txt']], { task: { ...selection, kind: 'native' } })
+  const forbidden = async () => { throw Error('Native CLI substitution') }
+  assert.equal(await L.run(root, { checks, agent: forbidden }), 2)
+  const original = read(root).handoffs[0]
+  fs.mkdirSync(path.join(root, 'inbox'), { recursive: true })
+  const responseFile = path.join(root, 'inbox', `${original.id}.json`)
+  fs.writeFileSync(responseFile, JSON.stringify({ ...result({ id: original.id }, 'needs_owner'), writer_stopped: false }))
+  assert.equal(await L.run(root, { checks, agent: forbidden }), 2)
+  let waiting = read(root)
+  assert.equal(waiting.groups[0].state, 'native')
+  assert.equal(waiting.groups[0].attempt.id, original.id)
+  assert.equal(waiting.questions.length, 0)
+  fs.writeFileSync(responseFile, JSON.stringify({ ...result({ id: original.id }, 'needs_owner'), writer_stopped: true }))
+  assert.equal(await L.run(root, { checks, agent: forbidden }), 2)
+  waiting = read(root)
+  assert.equal(waiting.questions[0].requires_owner, true)
+  assert.equal(waiting.groups[0].state, 'blocked')
+  answer(root, waiting.questions[0], 'owner')
+  assert.equal(await L.run(root, { checks, agent: forbidden }), 2)
+  const q = read(root)
+  assert.notEqual(q.groups[0].attempt.id, original.id)
+  assert.equal(q.handoffs.find(item => item.id === original.id).completed, true)
+  assert.equal(q.handoffs.find(item => item.id === original.id).superseded, true)
+  assert.equal(L.status(root).includes(`Native ${original.id}:`), false)
+})
 
-        assert.notEqual(result.code, 0)
-        assert.match(result.message, /final-message|identity|unique|unreadable|limit|completion evidence/i)
-        assert.deepEqual(result.launched, ['plan-001.md'])
-        assert.equal(fs.existsSync(path.join(queue, 'done', 'plan-001.md')), false)
-        assert.equal(fs.existsSync(path.join(queue, 'plan-002.md')), true)
-      } finally {
-        remove_temp_dir(dir)
-      }
-    })
+test('interrupted prepared integration retry preserves old attempt and makes fresh progress', { timeout: 30000 }, async () => {
+  const { root } = fixture([['a.txt']])
+  let interrupted
+  assert.equal(await L.run(root, { agent, checks, on_save: q => {
+    if (q.integration?.phase === 'prepared' && !interrupted) { interrupted = structuredClone(q.integration); throw Error('Crash before integration worktree creation') }
+  } }), 2)
+  const q = read(root)
+  assert.equal(q.groups[0].suspended_integration.phase, 'prepared')
+  answer(root, q.questions[0], 'host')
+  assert.equal(await L.run(root, { agent, checks }), 0)
+  const saved = read(root)
+  assert.notEqual(saved.groups[0].integration.id, interrupted.id)
+  assert.equal(saved.groups[0].state, 'done')
+})
+
+test('exceptional coordinator save waits for active jobs before rejecting', { timeout: 30000 }, async () => {
+  const { root } = fixture([['a.txt'], ['b.txt']])
+  let injected = false, secondStopped = false
+  await assert.rejects(L.run(root, { checks, agent: async args => {
+    if (args.prompt.includes('Group G2,')) {
+      await new Promise(resolve => {
+        if (args.signal.aborted) resolve()
+        else args.signal.addEventListener('abort', resolve, { once: true })
+      })
+      await new Promise(resolve => setImmediate(resolve))
+      secondStopped = true
+      return result(args.attempt, 'blocked')
+    }
+    return agent(args)
+  }, on_save: q => {
+    if (!injected && q.ready?.includes('G1') && q.groups[1].state === 'working') {
+      injected = true
+      throw Error('Injected exceptional coordinator save')
+    }
+  } }), /Injected exceptional coordinator save/)
+  assert.equal(secondStopped, true, 'run rejection must follow worker settlement')
+  const saved = fs.readFileSync(path.join(root, 'queue.json'), 'utf8')
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(fs.readFileSync(path.join(root, 'queue.json'), 'utf8'), saved, 'no job saves after rejection')
+})
+
+for (const foreign of [false, true]) test(`ordinary owner question ${foreign ? 'preserves foreign notebook ownership' : 'archives exact mapped notebook claim for fresh handoff'}`, { timeout: 30000 }, async () => {
+  const { root } = fixture([['a.txt']])
+  let firstId, marker, notebookBefore
+  assert.equal(await L.run(root, { checks, agent: async args => {
+    firstId = args.attempt.id
+    assert.ok(args.prompt.includes(`Use generated workflow session UUID ${firstId}`))
+    marker = path.join(args.cwd, '.aglite-records/.devlog.md.owner')
+    notebookBefore = fs.readFileSync(path.join(args.cwd, '.aglite-records/devlog.md'), 'utf8')
+    fs.writeFileSync(marker, JSON.stringify({ session: foreign ? 'foreign-owner-session' : firstId, note: 'Open ordinary Ask' }))
+    return result(args.attempt, 'needs_owner')
+  } }), 2)
+  const q = read(root)
+  const notebook = path.join(q.groups[0].workspace.worktree, '.aglite-records/devlog.md')
+  assert.equal(fs.readFileSync(notebook, 'utf8'), notebookBefore)
+  const archive = path.join(root, 'attempts', firstId, 'notebook-owner.released.json')
+  if (foreign) {
+    assert.equal(fs.existsSync(marker), true)
+    assert.equal(JSON.parse(fs.readFileSync(marker)).session, 'foreign-owner-session')
+    assert.equal(fs.existsSync(archive), false)
+    assert.match(q.questions[0].question, /Foreign isolated notebook claim/)
+    assert.equal(q.groups[0].state, 'blocked')
+  } else {
+    assert.equal(fs.existsSync(marker), false)
+    assert.equal(JSON.parse(fs.readFileSync(archive)).session, firstId)
+    assert.equal(q.questions[0].requires_owner, true)
+    answer(root, q.questions[0], 'owner')
+    assert.equal(await L.run(root, { checks, agent: async args => {
+      assert.notEqual(args.attempt.id, firstId)
+      assert.equal(fs.existsSync(marker), false)
+      assert.equal(fs.readFileSync(notebook, 'utf8'), notebookBefore)
+      return agent(args)
+    } }), 0)
+    assert.match(fs.readFileSync(notebook, 'utf8'), /# → Reply \/ A-001/)
   }
 })
 
-test('a generated Codex queue refuses reservation replacement before making the descriptor anonymous', async (t) => {
-  for (const scenario of ['reservation replacement']) {
-    await t.test(scenario, async () => {
-      const dir = make_temp_dir(`agentflow-looper-generated-final-race-${scenario.replaceAll(' ', '-')}`)
-      try {
-        const queue = make_queue()
-        const fake_child = make_fake_child(dir)
-        write_generated_queue(queue)
-        const config = {
-          switches: { 'cli-provider': 'on' },
-          'external-workers': [{ id: 'codex-test', command: ['codex', 'exec'], priority: 1, family: 'codex' }],
-        }
-        let output_path = null
-        let substituted_path = null
-        let spawned = false
-        let mutated = false
-        const file_system = new Proxy(fs, {
-          get(target, property) {
-            if (property === 'lstatSync') return file => {
-              if (!mutated && scenario === 'reservation replacement' && path.basename(file).startsWith('.last-message-')) {
-                mutated = true
-                substituted_path = file
-                fs.unlinkSync(file)
-                fs.writeFileSync(file, 'records/work.devlog.md updated\n')
-              }
-              return fs.lstatSync(file)
-            }
-            return target[property]
-          },
-        })
-        const result = await run_looper(base_options(queue, fake_child, {}, {
-          fs: file_system,
-          completion_path: undefined,
-          executable: undefined,
-          build_args: undefined,
-          worker_config: config,
-          executable_available: command => command === 'codex',
-          spawn: (_executable, args) => {
-            output_path = args[args.indexOf('--output-last-message') + 1]
-            spawned = true
-            return spawn(process.execPath, [fake_child, JSON.stringify({ mode: 'success', marker: 'not completion' })], {
-              stdio: ['ignore', 'pipe', 'pipe'],
-            })
-          },
-        }))
-
-        assert.notEqual(result.code, 0)
-        assert.equal(mutated, true)
-        assert.equal(fs.existsSync(substituted_path), true)
-        assert.equal(fs.existsSync(path.join(queue, 'done', 'plan-001.md')), false)
-        assert.equal(fs.existsSync(path.join(queue, 'plan-001.md')), true)
-        assert.equal(fs.existsSync(path.join(queue, 'plan-002.md')), true)
-        assert.deepEqual(result.launched, [])
-      } finally {
-        remove_temp_dir(dir)
-      }
-    })
-  }
+test('repair accepts a legitimate Markdown setext heading underline', { timeout: 30000 }, async () => {
+  const { root, repo } = fixture([['a.md']], { repair: selection, acceptance: { ...selection, provider: 'claude', model: 'test-counterpart' } })
+  let fail = true
+  assert.equal(await L.run(root, { checks: async args => {
+    if (path.basename(args.cwd).startsWith('aglite-merge-') && fail) { fail = false; return args.ids.map(id => ({ id, passed: false })) }
+    return checks(args)
+  }, agent: async args => {
+    if (args.role === 'task') return agent(args)
+    if (args.role === 'repair') fs.writeFileSync(path.join(args.cwd, 'a.md'), 'Legitimate heading\n=======\n\nResolved product documentation.\n')
+    return result(args.attempt)
+  } }), 0)
+  assert.equal(fs.readFileSync(path.join(repo, 'a.md'), 'utf8'), 'Legitimate heading\n=======\n\nResolved product documentation.\n')
 })
 
-test('an empty queue completes without launching or moving a plan', async () => {
-  const dir = make_temp_dir('agentflow-looper-empty')
-  try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    const result = await run_looper(base_options(queue, fake_child))
-    assert.equal(result.code, 0)
-    assert.match(result.message, /all plans are complete/i)
-    assert.deepEqual(read_json_lines(path.join(dir, 'missing.json')), [])
-    assert.deepEqual(fs.readdirSync(path.join(queue, 'done')), [])
-  } finally {
-    remove_temp_dir(dir)
+test('ag.json alone selects shared implementation/acceptance tiers and extensible catalogs', () => {
+  const { root, repo } = fixture([['a.txt']])
+  const file = path.join(repo, '.agentflow/ag.json')
+  const config = JSON.parse(fs.readFileSync(file))
+  config['looper-routes'] = {
+    task: { kind: 'native', provider: 'owner-host', 'model-family': 'owner-catalog' },
+    repair: { kind: 'native', provider: 'owner-host', 'model-family': 'owner-catalog' },
+    acceptance: { kind: 'native', provider: 'owner-host', 'model-family': 'owner-catalog' },
+    '//': 'ignored explanatory text'
   }
+  config['model-family'] = { 'owner-catalog': { basic: 'namespace/model/low', better: 'review-model/high', '//': 'comment' } }
+  config['pipeline-roles']['//'] = 'comment'
+  fs.writeFileSync(file, JSON.stringify(config))
+  const settings = L.read_settings(repo)
+  assert.equal(L.select(settings, 'task').model, L.select(settings, 'repair').model)
+  assert.equal(L.select(settings, 'task').effort, L.select(settings, 'repair').effort)
+  assert.equal(L.select(settings, 'task').model, 'namespace/model')
+  assert.equal(L.select(settings, 'task').effort, 'low')
+  assert.deepEqual(L.select(settings, 'review'), L.select(settings, 'acceptance'))
+  assert.equal(L.select(settings, 'review').model, 'review-model')
+  assert.equal(L.select(settings, 'review').source.tier, 'better')
+  assert.equal(L.select(settings, 'task').source.file, '.agentflow/ag.json')
+  assert.ok(!Object.hasOwn(L.load(root), 'task_worker'))
 })
 
-test('.break.txt is inert while the exact plan still completes', async () => {
-  const dir = make_temp_dir('agentflow-looper-break-inert')
-  try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    const launch_log = path.join(dir, 'launch.jsonl')
-    write_plan(queue, 'plan-001.md')
-    fs.writeFileSync(path.join(queue, '.break.txt'), 'ignored break marker\n')
-
-    const result = await run_looper(base_options(queue, fake_child, { launch_log }))
-
-    assert.equal(result.code, 0)
-    assert.deepEqual(result.launched, ['plan-001.md'])
-    assert.deepEqual(read_json_lines(launch_log).map((entry) => entry.task), ['plan-001.md'])
-    assert.ok(fs.existsSync(path.join(queue, 'done', 'plan-001.md')))
-    assert.ok(fs.existsSync(path.join(queue, '.break.txt')))
-    assert.equal(fs.existsSync(stop_path(queue)), false)
-  } finally {
-    remove_temp_dir(dir)
-  }
-})
-
-test('a pre-existing stop blocks work', async () => {
-  const dir = make_temp_dir('agentflow-looper-stop-before')
-  try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    write_plan(queue, 'plan-001.md')
-    fs.writeFileSync(stop_path(queue), 'human stop\n')
-    const result = await run_looper(base_options(queue, fake_child))
-    assert.notEqual(result.code, 0)
-    assert.match(result.message, /stop marker/i)
-    assert.equal(fs.existsSync(path.join(queue, 'done', 'plan-001.md')), false)
-    assert.equal(fs.readFileSync(stop_path(queue), 'utf8'), 'human stop\n')
-  } finally {
-    remove_temp_dir(dir)
-  }
-})
-
-test('the queue rescans after each archive and accepts new lower-numbered plans', async () => {
-  const dir = make_temp_dir('agentflow-looper-rescan')
-  try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    const launch_log = path.join(dir, 'launch.jsonl')
-    write_plan(queue, 'plan-001.md')
-    const result = await run_looper(base_options(queue, fake_child, {
-      launch_log,
-      mode: 'add-plan',
-      add_name: 'plan-000.md',
-    }))
-    assert.equal(result.code, 0)
-    assert.deepEqual(read_json_lines(launch_log).map((entry) => entry.task), ['plan-001.md', 'plan-000.md'])
-    assert.ok(fs.existsSync(path.join(queue, 'done', 'plan-000.md')))
-  } finally {
-    remove_temp_dir(dir)
-  }
-})
-
-test('completion accepts chunk-split exact evidence from either stream', async (t) => {
-  for (const stream of ['stdout', 'stderr']) {
-    await t.test(stream, async () => {
-      const dir = make_temp_dir(`agentflow-looper-chunks-${stream}`)
-      try {
-        const queue = make_queue()
-        const fake_child = make_fake_child(dir)
-        write_plan(queue, 'plan-001.md')
-        const result = await run_looper(base_options(queue, fake_child, {
-          mode: 'success',
-          stream,
-          chunks: ['dev', 'log.md up', 'dated\n'],
-        }))
-        assert.equal(result.code, 0)
-        assert.ok(fs.existsSync(path.join(queue, 'done', 'plan-001.md')))
-      } finally {
-        remove_temp_dir(dir)
-      }
-    })
-  }
-})
-
-test('completion failures are safe and do not start later plans', async (t) => {
+test('invalid selected settings fail before claims; status remains read-only without valid settings', async () => {
+  const { root, repo } = fixture([['a.txt']])
+  const file = path.join(repo, '.agentflow/ag.json'), original = fs.readFileSync(file, 'utf8')
+  const queue = fs.readFileSync(path.join(root, 'queue.json'), 'utf8')
   const cases = [
-    ['prefix and suffix', { mode: 'prefix-suffix' }, /exactly one|completion/i],
-    ['line split across logical lines', { mode: 'logical-split' }, /exactly one|completion/i],
-    ['missing marker', { mode: 'no-marker' }, /exactly one|completion/i],
-    ['hook replacement', { mode: 'success', chunks: ['hook replaced\n'] }, /exactly one|completion/i],
-    ['duplicate markers in one stream', { mode: 'duplicate-stream' }, /exactly one|duplicate/i],
-    ['non-zero exit', { mode: 'exit', exit_code: 7 }, /exit|completion/i],
+    [c => { delete c['looper-routes'].task }, /looper-routes.task required/],
+    [c => { delete c['pipeline-roles'].implementation }, /pipeline-roles.implementation/],
+    [c => { c['model-family'].task.basic = 'missing-effort' }, /model-family.task.basic/],
+    [c => { c['looper-routes'].task.provider = 'unknown-cli' }, /Unsupported CLI provider/],
+    [c => { c['model-family'].task.basic = 'm/unsupported' }, /Unsupported selected effort/],
+    [c => { c['looper-routes'].task.model = 'duplicate' }, /belongs in model-family/],
+    [c => { c['looper-limits']['max-workers'] = 0 }, /looper-limits.max-workers/],
+    [c => { c['looper-limits']['max-repairs'] = -1 }, /looper-limits.max-repairs/],
+    [c => { c['looper-limits']['max-workers'] = null }, /looper-limits.max-workers/]
   ]
-
-  for (const [name, config, error_pattern] of cases) {
-    await t.test(name, async () => {
-      const dir = make_temp_dir(`agentflow-looper-failure-${name.replaceAll(' ', '-')}`)
-      try {
-        const queue = make_queue()
-        const fake_child = make_fake_child(dir)
-        const launch_log = path.join(dir, 'launch.jsonl')
-        write_plan(queue, 'plan-001.md')
-        write_plan(queue, 'plan-002.md')
-        const result = await run_looper(base_options(queue, fake_child, { ...config, launch_log }))
-        assert.notEqual(result.code, 0)
-        assert.match(result.message, error_pattern)
-        assert.deepEqual(read_json_lines(launch_log).map((entry) => entry.task), ['plan-001.md'])
-        assert.ok(fs.existsSync(path.join(queue, 'plan-001.md')))
-        assert.equal(fs.existsSync(path.join(queue, 'done', 'plan-001.md')), false)
-        assert.equal(fs.existsSync(path.join(queue, 'plan-002.md')), true)
-      } finally {
-        remove_temp_dir(dir)
-      }
-    })
+  for (const [mutate, error] of cases) {
+    const config = JSON.parse(original); mutate(config)
+    fs.writeFileSync(file, JSON.stringify(config))
+    await assert.rejects(L.run(root, { agent, checks }), error)
+    assert.equal(fs.existsSync(path.join(root, '.queue.owner')), false)
+    assert.equal(fs.readFileSync(path.join(root, 'queue.json'), 'utf8'), queue)
+    assert.match(L.status(root), /Tasks 0\/1/)
   }
+  fs.writeFileSync(file, '{ invalid')
+  await assert.rejects(L.run(root, { agent, checks }), /ag\.json/)
+  assert.equal(fs.readFileSync(path.join(root, 'queue.json'), 'utf8'), queue)
+  const config = JSON.parse(original)
+  delete config['looper-limits']
+  fs.writeFileSync(file, JSON.stringify(config))
+  assert.equal(L.read_settings(repo).max_workers, 3)
+  assert.equal(L.read_settings(repo).max_repairs, 2)
 })
 
-test('one exact completion line copied to stdout and stderr counts as one worker completion', async () => {
-  const dir = make_temp_dir('agentflow-looper-duplicated-transport')
-  try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    write_plan(queue, 'plan-001.md')
-    write_plan(queue, 'plan-002.md')
-    const result = await run_looper(base_options(queue, fake_child, { mode: 'duplicate' }))
-    assert.equal(result.code, 0)
-    assert.ok(fs.existsSync(path.join(queue, 'done', 'plan-001.md')))
-    assert.ok(fs.existsSync(path.join(queue, 'done', 'plan-002.md')))
-  } finally {
-    remove_temp_dir(dir)
-  }
+test('queue refuses editable worker and limit overrides', () => {
+  const { root, q } = fixture([['a.txt']])
+  for (const key of ['task_worker', 'repair_worker', 'review_worker', 'acceptance_worker', 'max_workers', 'max_repairs'])
+    assert.throws(() => L.validate({ ...q, [key]: key.endsWith('worker') ? selection : 2 }, root), new RegExp(key))
 })
 
-test('a child-created stop prevents archive and all later launches without interrupting the child', async () => {
-  const dir = make_temp_dir('agentflow-looper-stop-during')
-  try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    const launch_log = path.join(dir, 'launch.jsonl')
-    write_plan(queue, 'plan-001.md')
-    write_plan(queue, 'plan-002.md')
-    const result = await run_looper(base_options(queue, fake_child, { mode: 'stop', launch_log }))
-    assert.notEqual(result.code, 0)
-    assert.deepEqual(read_json_lines(launch_log).map((entry) => entry.task), ['plan-001.md'])
-    assert.ok(fs.existsSync(stop_path(queue)))
-    assert.ok(fs.existsSync(path.join(queue, 'plan-001.md')))
-    assert.equal(fs.existsSync(path.join(queue, 'done', 'plan-001.md')), false)
-  } finally {
-    remove_temp_dir(dir)
+test('native resume preserves selections and drains outstanding results after lowering concurrency', { timeout: 30000 }, async () => {
+  const { root, repo } = fixture([['a.txt', 'b.txt'], ['c.txt']], { task: { ...selection, kind: 'native' } })
+  const noCli = async () => { throw Error('must not substitute CLI') }
+  assert.equal(await L.run(root, { checks, agent: noCli }), 2)
+  // Simulate outstanding attempts recorded before configuration relocation.
+  const pending = read(root)
+  for (const group of pending.groups) group.attempt.selection.source.file = 'ag.json'
+  for (const handoff of pending.handoffs) handoff.selection.source.file = 'ag.json'
+  write(root, pending)
+  const first = read(root).handoffs
+  assert.equal(first.length, 2)
+  const file = path.join(repo, '.agentflow/ag.json'), config = JSON.parse(fs.readFileSync(file))
+  config['model-family'].task.basic = 'changed-model/high'
+  config['looper-limits']['max-workers'] = 1
+  fs.writeFileSync(file, JSON.stringify(config))
+  fs.mkdirSync(path.join(root, 'inbox'), { recursive: true })
+  for (const handoff of first) {
+    assert.equal(handoff.selection.model, selection.model)
+    task_edit({ cwd: handoff.cwd, prompt: fs.readFileSync(handoff.assignment, 'utf8') })
+    fs.writeFileSync(path.join(root, 'inbox', `${handoff.id}.json`), JSON.stringify({ ...result({ id: handoff.id }), writer_stopped: true }))
   }
+  assert.equal(await L.run(root, { checks, agent: noCli }), 2)
+  const q = read(root)
+  for (const handoff of first) {
+    const saved = q.handoffs.find(x => x.id === handoff.id)
+    assert.equal(saved.completed, true)
+    assert.deepEqual(saved.selection, handoff.selection)
+    assert.equal(saved.selection.source.file, 'ag.json')
+  }
+  const next = q.handoffs.find(x => !x.completed)
+  assert.ok(next)
+  assert.equal(next.selection.model, 'changed-model')
+  assert.equal(next.selection.effort, 'high')
+  assert.equal(next.selection.source.file, '.agentflow/ag.json')
+  assert.notEqual(next.selection.source.digest, first[0].selection.source.digest)
+  assert.deepEqual(q.groups[0].attempt.selection, next.selection)
+  task_edit({ cwd: next.cwd, prompt: fs.readFileSync(next.assignment, 'utf8') })
+  fs.writeFileSync(path.join(root, 'inbox', `${next.id}.json`), JSON.stringify({ ...result({ id: next.id }), writer_stopped: true }))
+  assert.equal(await L.run(root, { checks, agent: noCli }), 0)
+  assert.equal(read(root).handoffs.length, 3, 'no completed task replayed')
 })
 
-test('large output retains only a bounded diagnostic tail', async () => {
-  const dir = make_temp_dir('agentflow-looper-large')
-  try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    write_plan(queue, 'plan-001.md')
-    const result = await run_looper(base_options(queue, fake_child, { mode: 'large-success' }))
-    assert.equal(result.code, 0)
-    const record = read_json(attempt_path(queue))
-    assert.equal(Object.hasOwn(record, 'diagnostic_tail'), false)
-    assert.equal(Object.hasOwn(record, 'stdout'), false)
-    assert.equal(Object.hasOwn(record, 'stderr'), false)
-    assert.equal(Object.hasOwn(record, 'raw_output'), false)
-    assert.equal(fs.readdirSync(queue).some((name) => name.includes('.tmp')), false)
-  } finally {
-    remove_temp_dir(dir)
+test('a restarted repair can use the available same-provider fresh reviewer', { timeout: 30000 }, async () => {
+  const { root, repo } = fixture([['a.txt']], { repair: selection, acceptance: { ...selection, provider: 'claude' } })
+  let combined = 0, reviews = 0
+  const attempts = []
+  const perform = async args => {
+    fs.mkdirSync(args.attempt_dir, { recursive: true })
+    if (args.role === 'task') task_edit(args)
+    if (args.role === 'repair') fs.writeFileSync(path.join(args.cwd, 'a.txt'), 'fixed\n')
+    if (args.role === 'review') reviews++
+    attempts.push({ role: args.role, id: args.attempt.id, provider: args.selection.provider })
+    return result(args.attempt)
   }
-})
-
-test('failed and uncertain output retains only the bounded diagnostic tail', async () => {
-  const dir = make_temp_dir('agentflow-looper-large-failure')
-  try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    write_plan(queue, 'plan-001.md')
-    const result = await run_looper(base_options(queue, fake_child, {
-      mode: 'large-success',
-      exit_code: 7,
-    }))
-    assert.notEqual(result.code, 0)
-    const record = read_json(attempt_path(queue))
-    assert.ok(Buffer.byteLength(record.diagnostic_tail || '', 'utf8') <= 4096)
-    assert.match(record.diagnostic_tail, /devlog\.md updated/)
-    assert.equal(Object.hasOwn(record, 'stdout'), false)
-    assert.equal(Object.hasOwn(record, 'stderr'), false)
-    assert.equal(Object.hasOwn(record, 'raw_output'), false)
-  } finally {
-    remove_temp_dir(dir)
-  }
-})
-
-test('successful stdout and stderr are absent from the final completed record', async () => {
-  const dir = make_temp_dir('agentflow-looper-success-output')
-  try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    write_plan(queue, 'plan-001.md')
-    const result = await run_looper(base_options(queue, fake_child, {
-      mode: 'both-output',
-    }))
-    assert.equal(result.code, 0)
-    const record = read_json(attempt_path(queue))
-    assert.equal(record.phase, 'completed')
-    assert.equal(Object.hasOwn(record, 'diagnostic_tail'), false)
-    assert.doesNotMatch(JSON.stringify(record), /arbitrary stdout|arbitrary stderr/)
-  } finally {
-    remove_temp_dir(dir)
-  }
-})
-
-test('existing ownership is never stolen or changed', async () => {
-  const dir = make_temp_dir('agentflow-looper-stale-lock')
-  try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    write_plan(queue, 'plan-001.md')
-    fs.mkdirSync(protected_state_dir(queue), { recursive: true, mode: 0o700 })
-    fs.mkdirSync(lock_path(queue))
-    fs.writeFileSync(path.join(lock_path(queue), 'owner.json'), '{"pid":999999,"stale":true}\n')
-    const before = fs.readFileSync(path.join(lock_path(queue), 'owner.json'))
-    const result = await run_looper(base_options(queue, fake_child))
-    assert.notEqual(result.code, 0)
-    assert.match(result.message, /human review|ownership/i)
-    assert.deepEqual(fs.readFileSync(path.join(lock_path(queue), 'owner.json')), before)
-    assert.equal(fs.existsSync(path.join(queue, 'plan-001.md')), true)
-  } finally {
-    remove_temp_dir(dir)
-  }
-})
-
-test('an incomplete attempt blocks recovery without launching a child', async () => {
-  const dir = make_temp_dir('agentflow-looper-attempt-block')
-  try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    write_plan(queue, 'plan-001.md')
-    fs.mkdirSync(protected_state_dir(queue), { recursive: true, mode: 0o700 })
-    fs.writeFileSync(attempt_path(queue), JSON.stringify({ phase: 'launch-intent', selected_path: path.join(queue, 'plan-001.md') }) + '\n')
-    const before = fs.readFileSync(attempt_path(queue))
-    const result = await run_looper(base_options(queue, fake_child))
-    assert.notEqual(result.code, 0)
-    assert.match(result.message, /incomplete attempt|human review/i)
-    assert.deepEqual(fs.readFileSync(attempt_path(queue)), before)
-    assert.equal(fs.existsSync(lock_path(queue)), false)
-  } finally {
-    remove_temp_dir(dir)
-  }
-})
-
-test('--reset retires reviewed stale attempt, stop, and ownership records without running the queue', async () => {
-  const dir = make_temp_dir('agentflow-looper-reset')
-  try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    write_plan(queue, 'plan-001.md')
-    const failed = await run_looper(base_options(queue, fake_child, { mode: 'no-marker' }))
-    assert.notEqual(failed.code, 0)
-    const state_dir = protected_state_dir(queue)
-    assert.equal(fs.existsSync(attempt_path(queue)), true)
-    assert.equal(fs.existsSync(lock_path(queue)), true)
-    assert.equal(fs.existsSync(path.join(queue, '.stop.txt')), true)
-
-    const stderr = []
-    const reset = await run_looper(base_options(queue, fake_child, { mode: 'success' }, {
-      reset: true,
-      silent: false,
-      stderr: { write: chunk => stderr.push(String(chunk)) },
-      process_is_alive: () => false,
-    }))
-    assert.equal(reset.code, 0, reset.message)
-    assert.deepEqual(reset.launched, [])
-    assert.equal(reset.message, 'Reset complete. No plans were started.')
-    assert.equal(fs.existsSync(path.join(queue, 'plan-001.md')), true)
-    assert.equal(fs.existsSync(path.join(queue, 'done', 'plan-001.md')), false)
-    assert.equal(fs.existsSync(attempt_path(queue)), false)
-    assert.equal(fs.existsSync(lock_path(queue)), false)
-    assert.equal(fs.existsSync(path.join(queue, '.stop.txt')), false)
-    assert.equal(fs.readdirSync(state_dir).some(name => name.startsWith('.looper-reset-attempt-')), true)
-    assert.equal(fs.readdirSync(state_dir).some(name => name.startsWith('.looper-reset-owner-')), true)
-    assert.equal(fs.readdirSync(queue).some(name => name.startsWith('.looper-reset-stop-')), true)
-    assert.match(stderr.join(''), /Reset retired:/)
-  } finally {
-    remove_temp_dir(dir)
-  }
-})
-
-test('--reset refuses live ownership without moving its evidence or launching work', async () => {
-  const dir = make_temp_dir('agentflow-looper-reset-live')
-  try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    write_plan(queue, 'plan-001.md')
-    await run_looper(base_options(queue, fake_child, { mode: 'no-marker' }))
-    let spawn_calls = 0
-    const reset = await run_looper(base_options(queue, fake_child, {}, {
-      reset: true,
-      process_is_alive: () => true,
-      spawn: () => { spawn_calls += 1 },
-    }))
-    assert.notEqual(reset.code, 0)
-    assert.match(reset.message, /reset refused.*live/i)
-    assert.equal(spawn_calls, 0)
-    assert.equal(fs.existsSync(attempt_path(queue)), true)
-    assert.equal(fs.existsSync(lock_path(queue)), true)
-    assert.equal(fs.existsSync(path.join(queue, '.stop.txt')), true)
-  } finally {
-    remove_temp_dir(dir)
-  }
-})
-
-test('--reset keeps stop recovery inside the queue and does not inspect an unrelated done symlink', async () => {
-  const dir = make_temp_dir('agentflow-looper-reset-symlink')
-  try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    write_plan(queue, 'plan-001.md')
-    await run_looper(base_options(queue, fake_child, { mode: 'no-marker' }))
-    const outside = path.join(dir, 'outside')
-    fs.mkdirSync(outside)
-    fs.renameSync(path.join(queue, 'done'), path.join(queue, 'done-original'))
-    fs.symlinkSync(outside, path.join(queue, 'done'))
-    let done_reads = 0
-    const injected_fs = new Proxy(fs, {
-      get(target, property) {
-        if (property === 'readdirSync') return (directory, ...args) => {
-          if (path.resolve(String(directory)) === path.resolve(queue, 'done')) done_reads += 1
-          return fs.readdirSync(directory, ...args)
-        }
-        const value = target[property]
-        return typeof value === 'function' ? value.bind(target) : value
-      },
-    })
-    const reset = await run_looper(base_options(queue, fake_child, {}, {
-      reset: true,
-      fs: injected_fs,
-      process_is_alive: () => false,
-    }))
-    assert.equal(reset.code, 0, reset.message)
-    assert.equal(reset.message, 'Reset complete. No plans were started.')
-    assert.deepEqual(reset.launched, [])
-    assert.equal(done_reads, 0)
-    assert.deepEqual(fs.readdirSync(outside), [])
-    assert.equal(fs.readdirSync(queue).some(name => name.startsWith('.looper-reset-stop-')), true)
-    assert.equal(fs.existsSync(path.join(queue, '.stop.txt')), false)
-    assert.equal(fs.existsSync(path.join(queue, 'plan-001.md')), true)
-  } finally {
-    remove_temp_dir(dir)
-  }
-})
-
-test('a complete completed record permits only the later queued plan', async () => {
-  const fixture = write_completed_fixture()
-  try {
-    const launch_log = path.join(fixture.dir, 'launch.jsonl')
-    const result = await run_looper(base_options(fixture.queue, fixture.fake_child, { launch_log }))
-    assert.equal(result.code, 0)
-    assert.deepEqual(result.launched, ['plan-002.md'])
-    assert.deepEqual(read_json_lines(launch_log).map((entry) => entry.task), ['plan-002.md'])
-    assert.equal(fs.existsSync(path.join(fixture.queue, 'done', 'plan-001.md')), true)
-    assert.equal(fs.existsSync(path.join(fixture.queue, 'done', 'plan-002.md')), true)
-  } finally {
-    remove_temp_dir(fixture.dir)
-  }
-})
-
-test('attempt record pathname replacement is rejected before substituted completion can launch later work', async () => {
-  const fixture = write_attempt_replacement_fixture()
-  try {
-    const launch_log = path.join(fixture.dir, 'launch.jsonl')
-    let replaced = false
-    const real_lstat = fs.lstatSync.bind(fs)
-    const injected_fs = new Proxy(fs, {
-      get(target, property) {
-        if (property === 'lstatSync') return (file, ...args) => {
-          const stat = real_lstat(file, ...args)
-          if (!replaced && path.resolve(String(file)) === path.resolve(attempt_path(fixture.queue))) {
-            replaced = true
-            fs.renameSync(attempt_path(fixture.queue), `${attempt_path(fixture.queue)}.original`)
-            fs.writeFileSync(attempt_path(fixture.queue), fixture.replacement_bytes)
-          }
-          return stat
-        }
-        const value = target[property]
-        return typeof value === 'function' ? value.bind(target) : value
-      },
-    })
-
-    const result = await run_looper(base_options(fixture.queue, fixture.fake_child, { launch_log }, {
-      fs: injected_fs,
-    }))
-
-    assert.equal(replaced, true)
-    assert.notEqual(result.code, 0)
-    assert.match(result.message, /attempt|identity|human review|regular/i)
-    assert.deepEqual(result.launched, [])
-    assert.deepEqual(read_json_lines(launch_log), [])
-    assert.equal(fs.existsSync(path.join(fixture.queue, 'plan-002.md')), true)
-    assert.equal(fs.existsSync(path.join(fixture.queue, 'done', 'plan-002.md')), false)
-    assert.equal(fs.existsSync(path.join(fixture.queue, 'done', 'plan-001.md')), true)
-    assert.deepEqual(fs.readFileSync(attempt_path(fixture.queue)), fixture.replacement_bytes)
-    assert.deepEqual(fs.readFileSync(`${attempt_path(fixture.queue)}.original`), fixture.original_bytes)
-  } finally {
-    remove_temp_dir(fixture.dir)
-  }
-})
-
-test('attempt record one byte over 1 MiB stops before whole-file read or launch', async () => {
-  const dir = make_temp_dir('agentflow-looper-attempt-over-ceiling')
-  try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    write_plan(queue, 'plan-001.md')
-    const attempt = attempt_path(queue)
-    const target_bytes = 1024 * 1024 + 1
-    const prefix = '{"phase":"launch-intent","padding":"'
-    const suffix = '"}'
-    const padding_bytes = target_bytes - Buffer.byteLength(prefix + suffix, 'utf8')
-    assert.ok(padding_bytes > 0)
-    const attempt_bytes = Buffer.from(prefix + 'x'.repeat(padding_bytes) + suffix)
-    assert.equal(attempt_bytes.length, target_bytes)
-    fs.mkdirSync(path.dirname(attempt), { recursive: true, mode: 0o700 })
-    fs.writeFileSync(attempt, attempt_bytes)
-
-    let read_file_calls = 0
-    let open_calls = 0
-    let spawn_calls = 0
-    const real_read_file = fs.readFileSync.bind(fs)
-    const real_open = fs.openSync.bind(fs)
-    const injected_fs = new Proxy(fs, {
-      get(target, property) {
-        if (property === 'readFileSync') return (file, ...args) => {
-          if (path.resolve(String(file)) === path.resolve(attempt)) read_file_calls += 1
-          return real_read_file(file, ...args)
-        }
-        if (property === 'openSync') return (file, ...args) => {
-          if (path.resolve(String(file)) === path.resolve(attempt)) open_calls += 1
-          return real_open(file, ...args)
-        }
-        const value = target[property]
-        return typeof value === 'function' ? value.bind(target) : value
-      },
-    })
-
-    const result = await run_looper(base_options(queue, fake_child, {}, {
-      fs: injected_fs,
-      spawn: () => {
-        spawn_calls += 1
-        throw new Error('spawn must not be reached')
-      },
-    }))
-
-    assert.notEqual(result.code, 0)
-    assert.match(result.message, /attempt|1,048,576|1048576|size|large/i)
-    assert.equal(read_file_calls, 0)
-    assert.equal(open_calls, 1)
-    assert.equal(spawn_calls, 0)
-    assert.equal(fs.existsSync(path.join(queue, 'plan-001.md')), true)
-    assert.equal(fs.existsSync(path.join(queue, 'done', 'plan-001.md')), false)
-  } finally {
-    remove_temp_dir(dir)
-  }
-})
-
-test('attempt record exactly 1 MiB reaches parsing without a size rejection', async () => {
-  const dir = make_temp_dir('agentflow-looper-attempt-ceiling')
-  try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    write_plan(queue, 'plan-001.md')
-    const attempt = attempt_path(queue)
-    const attempt_bytes = Buffer.alloc(1024 * 1024, 0x78)
-    fs.mkdirSync(path.dirname(attempt), { recursive: true, mode: 0o700 })
-    fs.writeFileSync(attempt, attempt_bytes)
-
-    let read_file_calls = 0
-    let open_calls = 0
-    let read_calls = 0
-    let attempt_fd = null
-    const real_read_file = fs.readFileSync.bind(fs)
-    const real_open = fs.openSync.bind(fs)
-    const real_read = fs.readSync.bind(fs)
-    const injected_fs = new Proxy(fs, {
-      get(target, property) {
-        if (property === 'readFileSync') return (file, ...args) => {
-          if (path.resolve(String(file)) === path.resolve(attempt)) read_file_calls += 1
-          return real_read_file(file, ...args)
-        }
-        if (property === 'openSync') return (file, ...args) => {
-          const fd = real_open(file, ...args)
-          if (path.resolve(String(file)) === path.resolve(attempt)) {
-            open_calls += 1
-            attempt_fd = fd
-          }
-          return fd
-        }
-        if (property === 'readSync') return (fd, ...args) => {
-          if (fd === attempt_fd) read_calls += 1
-          return real_read(fd, ...args)
-        }
-        const value = target[property]
-        return typeof value === 'function' ? value.bind(target) : value
-      },
-    })
-
-    const result = await run_looper(base_options(queue, fake_child, {}, { fs: injected_fs }))
-
-    assert.notEqual(result.code, 0)
-    assert.match(result.message, /invalid durable attempt evidence|JSON|Unexpected token/i)
-    assert.doesNotMatch(result.message, /exceeds|1,048,576|1048576/i)
-    assert.equal(read_file_calls, 0)
-    assert.equal(open_calls, 1)
-    assert.ok(read_calls > 0)
-    assert.deepEqual(result.launched, [])
-    assert.equal(fs.existsSync(path.join(queue, 'plan-001.md')), true)
-    assert.equal(fs.existsSync(path.join(queue, 'done', 'plan-001.md')), false)
-  } finally {
-    remove_temp_dir(dir)
-  }
-})
-
-test('attempt record descriptor identity mismatch closes the descriptor and stops safely', async () => {
-  const fixture = write_attempt_input_fixture()
-  try {
-    const attempt = attempt_path(fixture.queue)
-    const real_open = fs.openSync.bind(fs)
-    const real_fstat = fs.fstatSync.bind(fs)
-    const real_close = fs.closeSync.bind(fs)
-    let attempt_fd = null
-    let close_calls = 0
-    const injected_fs = new Proxy(fs, {
-      get(target, property) {
-        if (property === 'openSync') return (file, ...args) => {
-          const fd = real_open(file, ...args)
-          if (path.resolve(String(file)) === path.resolve(attempt)) attempt_fd = fd
-          return fd
-        }
-        if (property === 'fstatSync') return (fd, ...args) => {
-          const stat = real_fstat(fd, ...args)
-          if (fd !== attempt_fd) return stat
-          return new Proxy(stat, {
-            get(stat_target, stat_property, receiver) {
-              if (stat_property === 'ino') return other_inode(stat_target.ino)
-              return Reflect.get(stat_target, stat_property, receiver)
-            },
-          })
-        }
-        if (property === 'closeSync') return (fd, ...args) => {
-          if (fd === attempt_fd) close_calls += 1
-          return real_close(fd, ...args)
-        }
-        const value = target[property]
-        return typeof value === 'function' ? value.bind(target) : value
-      },
-    })
-    const result = await run_looper(base_options(fixture.queue, fixture.fake_child, {}, { fs: injected_fs }))
-    assert.notEqual(result.code, 0)
-    assert.match(result.message, /identity|attempt|human review/i)
-    assert.equal(attempt_fd !== null, true)
-    assert.equal(close_calls, 1)
-    assert.deepEqual(result.launched, [])
-    assert.equal(fs.existsSync(path.join(fixture.queue, 'done', 'plan-001.md')), false)
-  } finally {
-    remove_temp_dir(fixture.dir)
-  }
-})
-
-test('attempt record growth after the descriptor read stops before parsing or launch', async () => {
-  const fixture = write_attempt_input_fixture()
-  try {
-    const attempt = attempt_path(fixture.queue)
-    const real_open = fs.openSync.bind(fs)
-    const real_fstat = fs.fstatSync.bind(fs)
-    const real_close = fs.closeSync.bind(fs)
-    let attempt_fd = null
-    let attempt_fstat_calls = 0
-    let close_calls = 0
-    const injected_fs = new Proxy(fs, {
-      get(target, property) {
-        if (property === 'openSync') return (file, ...args) => {
-          const fd = real_open(file, ...args)
-          if (path.resolve(String(file)) === path.resolve(attempt)) attempt_fd = fd
-          return fd
-        }
-        if (property === 'fstatSync') return (fd, ...args) => {
-          const stat = real_fstat(fd, ...args)
-          if (fd !== attempt_fd) return stat
-          attempt_fstat_calls += 1
-          if (attempt_fstat_calls < 2) return stat
-          return new Proxy(stat, {
-            get(stat_target, stat_property, receiver) {
-              if (stat_property === 'size') return stat_target.size + 1
-              return Reflect.get(stat_target, stat_property, receiver)
-            },
-          })
-        }
-        if (property === 'closeSync') return (fd, ...args) => {
-          if (fd === attempt_fd) close_calls += 1
-          return real_close(fd, ...args)
-        }
-        const value = target[property]
-        return typeof value === 'function' ? value.bind(target) : value
-      },
-    })
-    const result = await run_looper(base_options(fixture.queue, fixture.fake_child, {}, { fs: injected_fs }))
-    assert.notEqual(result.code, 0)
-    assert.match(result.message, /changed|identity|size|attempt|human review/i)
-    assert.equal(attempt_fstat_calls, 2)
-    assert.equal(close_calls, 1)
-    assert.deepEqual(result.launched, [])
-    assert.equal(fs.existsSync(path.join(fixture.queue, 'done', 'plan-001.md')), false)
-  } finally {
-    remove_temp_dir(fixture.dir)
-  }
-})
-
-test('attempt record short descriptor read stops safely and closes the descriptor', async () => {
-  const fixture = write_attempt_input_fixture()
-  try {
-    const attempt = attempt_path(fixture.queue)
-    const real_open = fs.openSync.bind(fs)
-    const real_fstat = fs.fstatSync.bind(fs)
-    const real_read = fs.readSync.bind(fs)
-    const real_close = fs.closeSync.bind(fs)
-    let attempt_fd = null
-    let close_calls = 0
-    const injected_fs = new Proxy(fs, {
-      get(target, property) {
-        if (property === 'openSync') return (file, ...args) => {
-          const fd = real_open(file, ...args)
-          if (path.resolve(String(file)) === path.resolve(attempt)) attempt_fd = fd
-          return fd
-        }
-        if (property === 'readSync') return (fd, ...args) => {
-          if (fd === attempt_fd) return 0
-          return real_read(fd, ...args)
-        }
-        if (property === 'closeSync') return (fd, ...args) => {
-          if (fd === attempt_fd) close_calls += 1
-          return real_close(fd, ...args)
-        }
-        const value = target[property]
-        return typeof value === 'function' ? value.bind(target) : value
-      },
-    })
-    const result = await run_looper(base_options(fixture.queue, fixture.fake_child, {}, { fs: injected_fs }))
-    assert.notEqual(result.code, 0)
-    assert.match(result.message, /read|attempt|human review/i)
-    assert.equal(attempt_fd !== null, true)
-    assert.equal(close_calls, 1)
-    assert.deepEqual(result.launched, [])
-    assert.equal(fs.existsSync(path.join(fixture.queue, 'done', 'plan-001.md')), false)
-  } finally {
-    remove_temp_dir(fixture.dir)
-  }
-})
-
-test('attempt record close failure is conservative and does not launch work', async () => {
-  const fixture = write_attempt_input_fixture()
-  try {
-    const attempt = attempt_path(fixture.queue)
-    const real_open = fs.openSync.bind(fs)
-    const real_close = fs.closeSync.bind(fs)
-    let attempt_fd = null
-    let close_calls = 0
-    const injected_fs = new Proxy(fs, {
-      get(target, property) {
-        if (property === 'openSync') return (file, ...args) => {
-          const fd = real_open(file, ...args)
-          if (path.resolve(String(file)) === path.resolve(attempt)) attempt_fd = fd
-          return fd
-        }
-        if (property === 'closeSync') return (fd, ...args) => {
-          if (fd === attempt_fd) {
-            close_calls += 1
-            throw new Error('attempt descriptor close denied')
-          }
-          return real_close(fd, ...args)
-        }
-        const value = target[property]
-        return typeof value === 'function' ? value.bind(target) : value
-      },
-    })
-    const result = await run_looper(base_options(fixture.queue, fixture.fake_child, {}, { fs: injected_fs }))
-    assert.notEqual(result.code, 0)
-    assert.match(result.message, /close denied|close|attempt|human review/i)
-    assert.equal(attempt_fd !== null, true)
-    assert.equal(close_calls, 1)
-    assert.deepEqual(result.launched, [])
-    assert.equal(fs.existsSync(path.join(fixture.queue, 'done', 'plan-001.md')), false)
-  } finally {
-    remove_temp_dir(fixture.dir)
-  }
-})
-
-test('every missing or malformed completed fact blocks recovery before ownership or later launch', async (t) => {
-  const cases = [
-    ['version missing', (record) => { delete record.version }],
-    ['version malformed', (record) => { record.version = 2 }],
-    ['task missing', (record) => { delete record.task }],
-    ['task malformed', (record) => { record.task = 'not-a-plan' }],
-    ['selected path missing', (record) => { delete record.selected_path }],
-    ['selected path malformed', (record, queue) => { record.selected_path = path.join(fs.realpathSync(queue), 'plan-999.md') }],
-    ['selected sha256 missing', (record) => { delete record.sha256 }],
-    ['selected sha256 malformed', (record) => { record.sha256 = 'not-a-sha256' }],
-    ['selected dev missing', (record) => { delete record.dev }],
-    ['selected dev malformed', (record) => { record.dev = 'not-a-device' }],
-    ['selected inode missing', (record) => { delete record.ino }],
-    ['selected inode malformed', (record) => { record.ino = 'not-an-inode' }],
-    ['selected size missing', (record) => { delete record.size }],
-    ['selected size malformed', (record) => { record.size = -1 }],
-    ['exit code missing', (record) => { delete record.exit_code }],
-    ['exit code malformed', (record) => { record.exit_code = 1 }],
-    ['signal missing', (record) => { delete record.signal }],
-    ['signal malformed', (record) => { record.signal = 'SIGTERM' }],
-    ['completion match count missing', (record) => { delete record.completion_matches }],
-    ['completion match count malformed', (record) => { record.completion_matches = 2 }],
-    ['completion line missing', (record) => { delete record.completion_line }],
-    ['completion line malformed', (record) => { record.completion_line = 'wrong.md updated' }],
-    ['rechecked sha256 missing', (record) => { delete record.rechecked_sha256 }],
-    ['rechecked sha256 malformed', (record) => { record.rechecked_sha256 = '0'.repeat(64) }],
-    ['rechecked dev missing', (record) => { delete record.rechecked_dev }],
-    ['rechecked dev malformed', (record) => { record.rechecked_dev += 1 }],
-    ['rechecked inode missing', (record) => { delete record.rechecked_ino }],
-    ['rechecked inode malformed', (record) => { record.rechecked_ino = other_inode(record.rechecked_ino) }],
-    ['rechecked size missing', (record) => { delete record.rechecked_size }],
-    ['rechecked size malformed', (record) => { record.rechecked_size += 1 }],
-    ['archived flag missing', (record) => { delete record.archived }],
-    ['archived flag malformed', (record) => { record.archived = false }],
-    ['archive path missing', (record) => { delete record.archived_path }],
-    ['archive path malformed', (record, queue) => {
-      record.archived_path = path.join(fs.realpathSync(queue), 'done', 'plan-999.md')
-      fs.writeFileSync(record.archived_path, 'wrong archive name\n')
-    }],
-    ['archive sha256 missing', (record) => { delete record.archived_sha256 }],
-    ['archive sha256 malformed', (record) => { record.archived_sha256 = 'not-a-sha256' }],
-    ['archive dev missing', (record) => { delete record.archived_dev }],
-    ['archive dev malformed', (record) => { record.archived_dev += 1 }],
-    ['archive inode missing', (record) => { delete record.archived_ino }],
-    ['archive inode malformed', (record) => { record.archived_ino = other_inode(record.archived_ino) }],
-    ['archive size missing', (record) => { delete record.archived_size }],
-    ['archive size malformed', (record) => { record.archived_size += 1 }],
-  ]
-
-  for (const [name, mutate] of cases) {
-    await t.test(name, async () => {
-      const fixture = write_completed_fixture(({ record, queue }) => mutate(record, queue))
-      try {
-        await assert_untrustworthy_completed_record_blocks(fixture)
-      } finally {
-        remove_temp_dir(fixture.dir)
-      }
-    })
-  }
-})
-
-test('completed records reject noncanonical paths and every unsafe archive object', async (t) => {
-  const cases = [
-    ['selected path outside canonical queue', ({ record, dir }) => {
-      record.selected_path = path.join(dir, 'outside', 'plan-001.md')
-    }],
-    ['selected path is not the recorded task basename', ({ record, queue }) => {
-      record.selected_path = path.join(fs.realpathSync(queue), 'plan-999.md')
-    }],
-    ['archive path outside canonical done directory', ({ record, dir }) => {
-      const outside_done = path.join(dir, 'outside-done')
-      fs.mkdirSync(outside_done)
-      record.archived_path = path.join(outside_done, 'plan-001.md')
-      fs.writeFileSync(record.archived_path, 'outside archive\n')
-    }],
-    ['archive path is not the recorded task basename', ({ record, queue }) => {
-      record.archived_path = path.join(fs.realpathSync(queue), 'done', 'plan-999.md')
-      fs.writeFileSync(record.archived_path, 'wrong basename archive\n')
-    }],
-    ['source is still present', ({ record, queue }) => {
-      fs.writeFileSync(record.selected_path, 'source returned\n')
-    }],
-    ['archive is missing', ({ record }) => {
-      fs.unlinkSync(record.archived_path)
-    }],
-    ['archive is symlinked', ({ record, dir }) => {
-      const target = path.join(dir, 'symlink-target.md')
-      fs.writeFileSync(target, 'symlink archive\n')
-      fs.unlinkSync(record.archived_path)
-      fs.symlinkSync(target, record.archived_path)
-    }],
-    ['archive is non-regular', ({ record }) => {
-      fs.unlinkSync(record.archived_path)
-      fs.mkdirSync(record.archived_path)
-    }],
-    ['archive is replaced with the same content', ({ record }) => {
-      const original = `${record.archived_path}.original`
-      fs.renameSync(record.archived_path, original)
-      fs.writeFileSync(record.archived_path, 'archived completed plan\n')
-    }],
-    ['archive content is corrupted', ({ record }) => {
-      fs.writeFileSync(record.archived_path, 'corrupted archive\n')
-    }],
-    ['archive identity is inconsistent', ({ record }) => {
-      record.archived_ino = other_inode(record.archived_ino)
-    }],
-  ]
-
-  for (const [name, mutate] of cases) {
-    await t.test(name, async () => {
-      const fixture = write_completed_fixture(mutate)
-      try {
-        await assert_untrustworthy_completed_record_blocks(fixture)
-      } finally {
-        remove_temp_dir(fixture.dir)
-      }
-    })
-  }
-})
-
-test('authoritative state is protected outside the repository and task tree', async (t) => {
-  for (const local_action of ['delete', 'replace']) {
-    await t.test(local_action, async () => {
-      const dir = make_temp_dir(`agentflow-looper-protected-state-${local_action}`)
-      try {
-        const root = path.join(dir, 'repo')
-        const queue = path.join(root, 'tasks')
-        fs.mkdirSync(path.join(queue, 'done'), { recursive: true })
-        const fake_child = make_fake_child(dir)
-        write_plan(queue, 'plan-001.md')
-        fs.mkdirSync(local_lock_path(queue))
-        fs.writeFileSync(path.join(local_lock_path(queue), 'owner.json'), 'task-local decoy\n')
-        fs.writeFileSync(local_attempt_path(queue), 'task-local decoy\n')
-        const result = await run_looper(base_options(queue, fake_child, {
-          mode: 'remove-task-state',
-          local_action,
-        }, { root }))
-        assert.equal(result.code, 0)
-        assert.equal(is_within(test_state_root, root), false)
-        assert.equal(is_within(test_state_root, queue), false)
-        assert.equal(is_within(test_state_root, os.tmpdir()), false)
-        assert.equal(read_json(attempt_path(queue)).phase, 'completed')
-        assert.equal(fs.existsSync(path.join(queue, 'done', 'plan-001.md')), true)
-        assert.equal(fs.existsSync(local_attempt_path(queue)), local_action === 'replace')
-      } finally {
-        remove_temp_dir(dir)
-      }
-    })
-  }
-})
-
-test('unsafe authoritative state roots stop before child launch', async () => {
-  const dir = make_temp_dir('agentflow-looper-unsafe-state')
-  try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    const launch_log = path.join(dir, 'launch.jsonl')
-    write_plan(queue, 'plan-001.md')
-    for (const state_root of [queue, process.cwd(), os.tmpdir()]) {
-      const result = await run_looper(base_options(queue, fake_child, { launch_log }, { state_root }))
-      assert.notEqual(result.code, 0)
-      assert.match(result.message, /protected state|unsafe|temporary|repository|task/i)
-      assert.deepEqual(read_json_lines(launch_log), [])
-      assert.equal(fs.existsSync(path.join(queue, 'done', 'plan-001.md')), false)
-      if (fs.existsSync(stop_path(queue))) fs.unlinkSync(stop_path(queue))
+  assert.equal(await L.run(root, { agent: perform, checks: async args => {
+    if (path.basename(args.cwd).startsWith('aglite-merge-')) {
+      combined++
+      if (combined === 1) return args.ids.map(id => ({ id, passed: false }))
+      throw Error('preserve repaired candidate before review')
     }
-  } finally {
-    remove_temp_dir(dir)
-  }
+    return checks(args)
+  } }), 2)
+  let q = read(root)
+  assert.equal(q.groups[0].suspended_integration.repair_selection.provider, 'codex')
+  const file = path.join(repo, '.agentflow/ag.json'), config = JSON.parse(fs.readFileSync(file))
+  config['looper-routes'].acceptance.provider = 'codex'
+  fs.writeFileSync(file, JSON.stringify(config))
+  fs.mkdirSync(path.join(root, 'inbox'), { recursive: true })
+  fs.writeFileSync(path.join(root, 'inbox/answers.json'), JSON.stringify([{ id: q.questions[0].id, answer: 'Recheck the preserved candidate.', source: 'host' }]))
+  assert.equal(await L.run(root, { agent: perform, checks }), 0)
+  q = read(root)
+  assert.equal(reviews, 1)
+  assert.equal(q.groups[0].state, 'done')
+  const repaired = attempts.filter(x => ['repair', 'review', 'acceptance'].includes(x.role))
+  assert.deepEqual(repaired.map(x => x.role), ['repair', 'review', 'acceptance'])
+  assert.equal(new Set(repaired.map(x => x.id)).size, 3)
+  assert.ok(repaired.every(x => x.provider === 'codex'))
+  assert.equal(fs.readFileSync(path.join(repo, 'a.txt'), 'utf8'), 'fixed\n')
 })
 
-test('canonical queue authority survives a task-directory symlink retarget', async () => {
-  const dir = make_temp_dir('agentflow-looper-canonical-queue')
-  try {
-    const root = path.join(dir, 'root')
-    const queue_a = path.join(root, 'queue-a')
-    const queue_b = path.join(root, 'queue-b')
-    const lexical_tasks = path.join(root, 'tasks')
-    fs.mkdirSync(path.join(queue_a, 'done'), { recursive: true })
-    fs.mkdirSync(path.join(queue_b, 'done'), { recursive: true })
-    write_plan(queue_a, 'plan-001.md', 'canonical queue A')
-    write_plan(queue_b, 'plan-001.md', 'retargeted queue B')
-    fs.symlinkSync(queue_a, lexical_tasks, 'dir')
-    const fake_child = make_fake_child(dir)
-    const launch_log = path.join(dir, 'launch.jsonl')
-    let prompt_context
-    let spawn_options
-    const result = await run_looper(base_options(lexical_tasks, fake_child, { launch_log }, {
-      root,
-      prompt_builder: (value) => {
-        prompt_context = value
-        return `canonical prompt ${value.relative_task}`
-      },
-      spawn: (executable, args, options) => {
-        spawn_options = options
-        return spawn(executable, args, options)
-      },
-      on_event: (event) => {
-        if (event.event !== 'ownership-acquired') return
-        fs.unlinkSync(lexical_tasks)
-        fs.symlinkSync(queue_b, lexical_tasks, 'dir')
-      },
-    }))
-
-    assert.equal(result.code, 0)
-    assert.deepEqual(read_json_lines(launch_log).map((entry) => entry.task), ['plan-001.md'])
-    assert.ok(fs.existsSync(path.join(queue_a, 'done', 'plan-001.md')))
-    assert.equal(fs.existsSync(path.join(queue_b, 'done', 'plan-001.md')), false)
-    assert.equal(fs.existsSync(path.join(queue_b, 'plan-001.md')), true)
-    assert.equal(prompt_context.tasks_dir, fs.realpathSync(queue_a))
-    assert.equal(prompt_context.root, fs.realpathSync(root))
-    assert.equal(prompt_context.plan_path, path.join(fs.realpathSync(queue_a), 'plan-001.md'))
-    assert.equal(spawn_options.cwd, fs.realpathSync(root))
-  } finally {
-    remove_temp_dir(dir)
-  }
+test('outstanding native repair imports despite lower repair budget and broken future review route', { timeout: 30000 }, async () => {
+  const { root, repo } = fixture([['a.txt']], { repair: { ...selection, kind: 'native' }, acceptance: { ...selection, provider: 'claude' } })
+  let fail = true
+  assert.equal(await L.run(root, { agent, checks: async args => {
+    if (path.basename(args.cwd).startsWith('aglite-merge-') && fail) { fail = false; return args.ids.map(id => ({ id, passed: false })) }
+    return checks(args)
+  } }), 2)
+  let q = read(root)
+  const handoff = q.handoffs.find(x => x.role === 'repair')
+  assert.ok(handoff)
+  fs.writeFileSync(path.join(handoff.cwd, 'a.txt'), 'native repair\n')
+  fs.mkdirSync(path.join(root, 'inbox'), { recursive: true })
+  fs.writeFileSync(path.join(root, 'inbox', `${handoff.id}.json`), JSON.stringify({ ...result({ id: handoff.id }), writer_stopped: true }))
+  const file = path.join(repo, '.agentflow/ag.json'), config = JSON.parse(fs.readFileSync(file))
+  config['looper-limits']['max-repairs'] = 0
+  delete config['looper-routes'].task // no new task remains; route is irrelevant to repair import
+  delete config['looper-routes'].acceptance
+  fs.writeFileSync(file, JSON.stringify(config))
+  assert.equal(await L.run(root, { agent, checks }), 2)
+  q = read(root)
+  assert.equal(q.handoffs.find(x => x.id === handoff.id).completed, true, 'import already dispatched repair before applying new settings')
+  assert.equal(q.groups[0].repairs, 1)
+  assert.equal(q.groups[0].suspended_integration.phase, 'review')
+  assert.ok(q.questions.some(x => /looper-routes.acceptance required/.test(x.question)))
+  config['looper-routes'].acceptance = { kind: 'cli', provider: 'claude', 'model-family': 'acceptance' }
+  fs.writeFileSync(file, JSON.stringify(config))
+  fs.writeFileSync(path.join(root, 'inbox/answers.json'), JSON.stringify([{ id: q.questions.find(x => !x.answer).id, answer: 'Review route restored; retain repaired candidate.', source: 'host' }]))
+  assert.equal(await L.run(root, { agent: async args => {
+    assert.ok(['review', 'acceptance'].includes(args.role), 'no task/repair replay')
+    return result(args.attempt)
+  }, checks }), 0)
+  assert.equal(fs.readFileSync(path.join(repo, 'a.txt'), 'utf8'), 'native repair\n')
+  assert.equal(read(root).handoffs.filter(x => x.role === 'repair').length, 1)
 })
 
-test('canonical queue replacement after acquisition stops before spawn', async () => {
-  const dir = make_temp_dir('agentflow-looper-canonical-queue-replacement')
-  try {
-    const root = path.join(dir, 'root')
-    const queue = path.join(root, 'tasks')
-    fs.mkdirSync(path.join(queue, 'done'), { recursive: true })
-    write_plan(queue, 'plan-001.md', 'original queue')
-    const original_queue = `${queue}.original`
-    const replacement_plan = path.join(queue, 'plan-001.md')
-    const fake_child = make_fake_child(dir)
-    const launch_log = path.join(dir, 'launch.jsonl')
-    const result = await run_looper(base_options(queue, fake_child, { launch_log }, {
-      root,
-      on_event: (event) => {
-        if (event.event !== 'ownership-acquired') return
-        fs.renameSync(queue, original_queue)
-        fs.mkdirSync(path.join(queue, 'done'), { recursive: true })
-        write_plan(queue, 'plan-001.md', 'replacement queue')
-      },
-    }))
-
-    assert.notEqual(result.code, 0)
-    assert.deepEqual(read_json_lines(launch_log), [])
-    assert.equal(fs.existsSync(path.join(original_queue, 'plan-001.md')), true)
-    assert.equal(fs.existsSync(replacement_plan), true)
-    assert.equal(fs.existsSync(path.join(queue, 'done', 'plan-001.md')), false)
-  } finally {
-    remove_temp_dir(dir)
-  }
+test('request file supplies exact original text to a real Git task and survives status without mutation', { timeout: 30000 }, async () => {
+  const { root, repo, q } = fixture([['a.txt']])
+  const original = '原始需求\r\nWrite a.txt without changing owner content.\r\n'
+  fs.writeFileSync(path.join(root, q.request), original)
+  q.request_sha256 = crypto.createHash('sha256').update(original).digest('hex')
+  write(root, q)
+  const before = fs.readFileSync(path.join(root, 'queue.json'))
+  assert.match(L.status(root), /planned/)
+  assert.deepEqual(fs.readFileSync(path.join(root, 'queue.json')), before)
+  assert.equal(await L.run(root, { checks, agent: async args => {
+    assert.ok(args.prompt.includes(`Original authorized request (context only; execute the selected task): ${original}\nExplicit session overrides:`))
+    return agent(args)
+  } }), 0)
+  assert.equal(read(root).groups[0].state, 'done')
+  assert.equal(fs.readFileSync(path.join(repo, 'a.txt'), 'utf8'), 'G1/T1-1\n')
+  assert.equal(fs.readFileSync(path.join(root, q.request), 'utf8'), original)
 })
 
-test('canonical root replacement after acquisition stops before spawn', async () => {
-  const dir = make_temp_dir('agentflow-looper-canonical-root-replacement')
-  try {
-    const root = path.join(dir, 'root')
-    const queue = path.join(root, 'tasks')
-    fs.mkdirSync(path.join(queue, 'done'), { recursive: true })
-    write_plan(queue, 'plan-001.md', 'original root')
-    const original_root = `${root}.original`
-    const fake_child = make_fake_child(dir)
-    const launch_log = path.join(dir, 'launch.jsonl')
-    const result = await run_looper(base_options(queue, fake_child, { launch_log }, {
-      root,
-      on_event: (event) => {
-        if (event.event !== 'ownership-acquired') return
-        fs.renameSync(root, original_root)
-        fs.mkdirSync(path.join(root, 'tasks', 'done'), { recursive: true })
-        write_plan(path.join(root, 'tasks'), 'plan-001.md', 'replacement root')
-      },
-    }))
-
-    assert.notEqual(result.code, 0)
-    assert.deepEqual(read_json_lines(launch_log), [])
-    assert.equal(fs.existsSync(path.join(original_root, 'tasks', 'plan-001.md')), true)
-    assert.equal(fs.existsSync(path.join(root, 'tasks', 'plan-001.md')), true)
-    assert.equal(fs.existsSync(path.join(root, 'tasks', 'done', 'plan-001.md')), false)
-  } finally {
-    remove_temp_dir(dir)
+test('invalid request files fail before claims or worktrees', async t => {
+  const cases = {
+    missing: ({ q }) => { q.request = 'missing.md' },
+    empty: ({ root }) => fs.writeFileSync(path.join(root, 'request.md'), ''),
+    directory: ({ q }) => { q.request = 'directory' },
+    absolute: ({ root, q }) => { q.request = path.join(root, 'request.md') },
+    traversal: ({ q }) => { q.request = '../request.md' },
+    symlink: ({ root, q }) => { fs.symlinkSync('request.md', path.join(root, 'alias.md')); q.request = 'alias.md' },
+    changed: ({ root }) => fs.appendFileSync(path.join(root, 'request.md'), ' changed'),
+    inline: ({ q }) => { q.request = 'Implement every original task.' },
+    digest: ({ q }) => { q.request_sha256 = 'not-a-digest' },
+    invalid_utf8: ({ root }) => fs.writeFileSync(path.join(root, 'request.md'), Buffer.from([0xff])),
+    old_schema: ({ q }) => { q.schema_version = 1 }
   }
-})
-
-test('canonical queue replacement before archive stops without moving either plan object', async () => {
-  const dir = make_temp_dir('agentflow-looper-canonical-archive-replacement')
-  try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    write_plan(queue, 'plan-001.md', 'original queue')
-    const original_queue = `${queue}.original`
-    const result = await run_looper(base_options(queue, fake_child, {}, {
-      before_archive_source_move: ({ source }) => {
-        fs.renameSync(queue, original_queue)
-        fs.mkdirSync(path.join(queue, 'done'), { recursive: true })
-        write_plan(queue, path.basename(source), 'replacement queue')
-      },
-    }))
-
-    assert.notEqual(result.code, 0)
-    assert.equal(fs.existsSync(path.join(original_queue, 'plan-001.md')), true)
-    assert.equal(fs.existsSync(path.join(queue, 'plan-001.md')), true)
-    assert.equal(fs.existsSync(path.join(queue, 'done', 'plan-001.md')), false)
-  } finally {
-    remove_temp_dir(dir)
-  }
-})
-
-test('pre-existing protected state requires a real directory, matching owner, and no group or other permission bit', { skip: process.platform === 'win32' ? 'requires POSIX owner and permission bits' : false }, async (t) => {
-  await t.test('wrong owner is refused', async () => {
-    const dir = make_temp_dir('agentflow-looper-state-owner')
-    try {
-      const queue = make_queue()
-      const fake_child = make_fake_child(dir)
-      const state_dir = protected_state_dir(queue)
-      fs.mkdirSync(state_dir, { recursive: true, mode: 0o700 })
-      const real_lstat = fs.lstatSync.bind(fs)
-      const injected_fs = new Proxy(fs, {
-        get(target, property) {
-          if (property === 'lstatSync') return (file, ...args) => {
-            const stat = real_lstat(file, ...args)
-            if (path.resolve(String(file)) !== path.resolve(state_dir)) return stat
-            return new Proxy(stat, {
-              get(stat_target, stat_property, receiver) {
-                if (stat_property === 'uid') return stat_target.uid + 1
-                return Reflect.get(stat_target, stat_property, receiver)
-              },
-            })
-          }
-          const value = target[property]
-          return typeof value === 'function' ? value.bind(target) : value
-        },
-      })
-      write_plan(queue, 'plan-001.md')
-      const result = await run_looper(base_options(queue, fake_child, {}, { fs: injected_fs }))
-      assert.notEqual(result.code, 0)
-      assert.equal(fs.existsSync(path.join(queue, 'done', 'plan-001.md')), false)
-    } finally {
-      remove_temp_dir(dir)
+  for (const [name, change] of Object.entries(cases)) await t.test(name, async st => {
+    const f = fixture([['a.txt']])
+    fs.mkdirSync(path.join(f.root, 'directory'))
+    try { change(f) } catch (error) {
+      if (name !== 'symlink' || process.platform !== 'win32' || error.code !== 'EPERM') throw error
+      st.skip('Windows file-symlink privilege unavailable (EPERM); refusal remains unproved'); return
     }
-  })
-
-  for (const mode of [0o720, 0o702, 0o704, 0o740, 0o755]) {
-    await t.test(`mode ${mode.toString(8)} is refused`, async () => {
-      const dir = make_temp_dir(`agentflow-looper-state-mode-${mode.toString(8)}`)
-      try {
-        const queue = make_queue()
-        const fake_child = make_fake_child(dir)
-        const state_dir = protected_state_dir(queue)
-        fs.mkdirSync(state_dir, { recursive: true, mode: 0o700 })
-        fs.chmodSync(state_dir, mode)
-        write_plan(queue, 'plan-001.md')
-        const result = await run_looper(base_options(queue, fake_child))
-        assert.notEqual(result.code, 0)
-        assert.equal(fs.existsSync(path.join(queue, 'done', 'plan-001.md')), false)
-      } finally {
-        remove_temp_dir(dir)
-      }
-    })
-  }
-
-  await t.test('symlink state is refused', async () => {
-    const dir = make_temp_dir('agentflow-looper-state-symlink')
-    try {
-      const queue = make_queue()
-      const fake_child = make_fake_child(dir)
-      const state_dir = protected_state_dir(queue)
-      const state_target = path.join(dir, 'state-target')
-      fs.mkdirSync(state_target, { recursive: true, mode: 0o700 })
-      fs.mkdirSync(path.dirname(state_dir), { recursive: true })
-      fs.symlinkSync(state_target, state_dir, 'dir')
-      write_plan(queue, 'plan-001.md')
-      const result = await run_looper(base_options(queue, fake_child))
-      assert.notEqual(result.code, 0)
-      assert.equal(fs.existsSync(path.join(queue, 'done', 'plan-001.md')), false)
-    } finally {
-      remove_temp_dir(dir)
-    }
+    write(f.root, f.q)
+    const errors = { missing: /ENOENT/, empty: /nonempty UTF-8/, directory: /regular file/, absolute: /relative path/, traversal: /Unsafe path/, symlink: /Symlink path refused/, changed: /Original request changed/, inline: /ENOENT/, digest: /request_sha256 required/, invalid_utf8: /nonempty UTF-8/, old_schema: /Queue schema 2.*prior runtime/ }
+    await assert.rejects(L.run(f.root), errors[name], name)
+    assert.equal(fs.existsSync(path.join(f.root, '.queue.owner')), false)
+    assert.equal(fs.existsSync(path.join(f.repo, '.wts')), false)
+    assert.equal(git(f.repo, 'rev-parse', 'HEAD'), f.q.base_commit)
   })
 })
 
-test('replacing active authoritative lock or owner evidence stops without deleting the replacement', async (t) => {
-  for (const target of ['owner', 'owner-token', 'lock']) {
-    await t.test(target, async () => {
-      const dir = make_temp_dir(`agentflow-looper-replaced-${target}`)
-      try {
-        const queue = make_queue()
-        const fake_child = make_fake_child(dir)
-        const launch_log = path.join(dir, 'launch.jsonl')
-        write_plan(queue, 'plan-001.md')
-        let replacement_bytes
-        const result = await run_looper(base_options(queue, fake_child, { launch_log }, {
-          on_event: (event) => {
-            if (event.event !== 'ownership-acquired') return
-            const owner_file = path.join(event.lock_dir, 'owner.json')
-            replacement_bytes = Buffer.from(JSON.stringify({ owner_token: 'replacement-owner', pid: 1 }) + '\n')
-            if (target === 'owner') {
-              fs.renameSync(owner_file, owner_file + '.original')
-              fs.writeFileSync(owner_file, replacement_bytes)
-            } else if (target === 'owner-token') {
-              fs.writeFileSync(owner_file, replacement_bytes)
-            } else {
-              fs.renameSync(event.lock_dir, event.lock_dir + '.original')
-              fs.mkdirSync(event.lock_dir)
-              fs.writeFileSync(path.join(event.lock_dir, 'owner.json'), replacement_bytes)
-            }
-          },
-        }))
-        assert.notEqual(result.code, 0)
-        assert.deepEqual(read_json_lines(launch_log), [])
-        assert.equal(fs.existsSync(path.join(queue, 'done', 'plan-001.md')), false)
-        assert.ok(replacement_bytes)
-        assert.deepEqual(fs.readFileSync(path.join(lock_path(queue), 'owner.json')), replacement_bytes)
-        assert.equal(fs.existsSync(lock_path(queue)), true)
-      } finally {
-        remove_temp_dir(dir)
+test('request mutation after a native pause blocks resume while status preserves diagnostics', { timeout: 30000 }, async () => {
+  const { root, q } = fixture([['a.txt']], { task: { ...selection, kind: 'native' } })
+  assert.equal(await L.run(root, { checks }), 2)
+  const saved = read(root), original = fs.readFileSync(path.join(root, q.request))
+  fs.appendFileSync(path.join(root, q.request), '\nchanged original')
+  await assert.rejects(L.run(root, { checks }), /Original request changed/)
+  assert.match(L.status(root), /Request input blocked: Original request changed/)
+  assert.deepEqual(read(root), saved)
+  fs.writeFileSync(path.join(root, q.request), original)
+  assert.doesNotThrow(() => L.load(root))
+})
+
+test('coordinator requires host migration for old configuration schema without rewriting it', () => {
+  const { repo } = fixture([['a.txt']])
+  const file = path.join(repo, '.agentflow/ag.json'), config = JSON.parse(fs.readFileSync(file))
+  for (const version of ['aglite-5', 8, 9, 10, 11, 12, String(current_schema), current_schema + 1]) {
+    config['schema-version'] = version; fs.writeFileSync(file, JSON.stringify(config))
+    const before = fs.readFileSync(file)
+    assert.throws(() => L.read_settings(repo), new RegExp(`migrate to integer ${current_schema} via the host`))
+    assert.deepEqual(fs.readFileSync(file), before)
+  }
+  config['schema-version'] = current_schema; fs.writeFileSync(file, JSON.stringify(config))
+  assert.doesNotThrow(() => L.read_settings(repo))
+  delete config['schema-version']; fs.writeFileSync(file, JSON.stringify(config))
+  assert.doesNotThrow(() => L.read_settings(repo))
+})
+
+test('dependency graphs start from checked integrated files and ancestry', { timeout: 30000 }, async () => {
+  for (const edges of [[[], [], [], ['G1', 'G2', 'G3']], [[], ['G1'], ['G1'], ['G1'], ['G2', 'G3', 'G4']]]) {
+    const { root, repo, q } = fixture(edges.map((_, i) => [`output-${i}.txt`]), { max_workers: 3 })
+    q.groups.forEach((g, i) => { g.depends_on = edges[i] }); write(root, q)
+    assert.equal(await L.run(root, { checks, agent: async args => {
+      const saved = read(root), group = saved.groups.find(g => args.prompt.includes(`Group ${g.id},`))
+      for (const dependency of group.depends_on) {
+        const ancestor = saved.groups.find(g => g.id === dependency)
+        assert.equal(ancestor.state, 'done')
+        assert.throws(() => git(repo, 'cat-file', '-e', `${q.base_commit}:${ancestor.tasks[0].allowed_paths[0]}`),
+          'the initial base cannot supply dependency outputs')
+        assert.ok(fs.existsSync(path.join(args.cwd, ancestor.tasks[0].allowed_paths[0])))
+        assert.equal(git(repo, 'merge-base', ancestor.integration.result, group.workspace.base), ancestor.integration.result)
       }
-    })
+      return agent(args)
+    } }), 0)
+    assert.ok(read(root).groups.every(g => g.state === 'done'))
   }
 })
 
-test('release verifies the acquiring owner and preserves a replacement', async () => {
-  const dir = make_temp_dir('agentflow-looper-release-replacement')
-  try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    write_plan(queue, 'plan-001.md')
-    const replacement = Buffer.from('{"owner_token":"replacement-owner","pid":1}\n')
-    let replacement_path
-    const result = await run_looper(base_options(queue, fake_child, {}, {
-      on_event: (event) => {
-        if (event.event !== 'plan-completed') return
-        const owner_file = path.join(lock_path(queue), 'owner.json')
-        replacement_path = owner_file
-        fs.renameSync(owner_file, owner_file + '.original')
-        fs.writeFileSync(owner_file, replacement)
-      },
-    }))
-    assert.notEqual(result.code, 0)
-    assert.match(result.message, /release|ownership|owner/i)
-    assert.equal(fs.existsSync(path.join(queue, 'done', 'plan-001.md')), true)
-    assert.deepEqual(fs.readFileSync(replacement_path), replacement)
-    assert.equal(fs.existsSync(lock_path(queue)), true)
-  } finally {
-    remove_temp_dir(dir)
+test('invalid dependency edges refuse before claims or worktrees', async () => {
+  for (const value of [null, 'G1', {}, [1], ['missing'], ['G2'], ['G1', 'G1'], ['G3']]) {
+    const { root, repo, q } = fixture([['a.txt'], ['b.txt'], ['c.txt']])
+    q.groups[1].depends_on = value; write(root, q)
+    await assert.rejects(L.run(root, { agent, checks }), /depends_on/)
+    assert.equal(fs.existsSync(path.join(root, '.queue.owner')), false)
+    assert.equal(fs.existsSync(path.join(repo, '.wts')), false)
   }
 })
 
-test('clean ownership release retains a verified retired owner directory', async () => {
-  const dir = make_temp_dir('agentflow-looper-retired-owner')
-  try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    write_plan(queue, 'plan-001.md')
-    const result = await run_looper(base_options(queue, fake_child))
-    const state_dir = protected_state_dir(queue)
-    const retired = fs.readdirSync(state_dir).filter((name) => name.startsWith('.looper-retired-'))
+test('blocked ancestor leaves dependent unstarted while independent group integrates', { timeout: 30000 }, async () => {
+  const { root, q } = fixture([['a.txt'], ['archive.txt'], ['independent.txt']], { max_workers: 1 })
+  q.groups[1].depends_on = ['G1']; write(root, q)
+  assert.equal(await L.run(root, { checks, agent: async args => args.prompt.includes('Group G1,')
+    ? result(args.attempt, 'blocked') : agent(args) }), 2)
+  const saved = read(root)
+  assert.equal(saved.groups[0].state, 'blocked')
+  assert.equal(saved.groups[1].workspace, undefined)
+  assert.equal(saved.groups[2].state, 'done')
+  assert.match(L.status(root), /G2: pending;.*unmet dependencies G1\n  records not started/)
+})
 
-    assert.equal(result.code, 0)
-    assert.equal(fs.existsSync(lock_path(queue)), false)
-    assert.equal(retired.length, 1)
-    const retired_owner = path.join(state_dir, retired[0], 'owner.json')
-    assert.equal(fs.lstatSync(path.join(state_dir, retired[0])).isDirectory(), true)
-    assert.match(read_json(retired_owner).owner_token, /^[0-9a-f]{64}$/)
-  } finally {
-    remove_temp_dir(dir)
+test('dependent native pause resumes same workspace and refuses missing integration proof', { timeout: 30000 }, async () => {
+  const { root, repo, q } = fixture([['a.txt'], ['archive.txt']], { task: { ...selection, kind: 'native' } })
+  q.groups[1].depends_on = ['G1']; write(root, q)
+  const noCli = async () => { throw Error('CLI substitution forbidden') }
+  const finish = handoff => {
+    task_edit({ cwd: handoff.cwd, prompt: fs.readFileSync(handoff.assignment, 'utf8') })
+    fs.mkdirSync(path.join(root, 'inbox'), { recursive: true })
+    fs.writeFileSync(path.join(root, 'inbox', `${handoff.id}.json`), JSON.stringify({ ...result({ id: handoff.id }), writer_stopped: true }))
+  }
+  assert.equal(await L.run(root, { agent: noCli, checks }), 2)
+  assert.equal(read(root).groups[1].workspace, undefined)
+  finish(read(root).handoffs[0])
+  assert.equal(await L.run(root, { agent: noCli, checks }), 2)
+  const paused = read(root), workspace = paused.groups[1].workspace, handoff = paused.handoffs.at(-1)
+  assert.ok(fs.existsSync(path.join(workspace.worktree, 'a.txt')))
+  assert.equal(git(repo, 'merge-base', paused.groups[0].integration.result, workspace.base), paused.groups[0].integration.result)
+  fs.writeFileSync(path.join(workspace.worktree, 'archive.txt'), 'unfinished dependent edit\n')
+  assert.equal(await L.run(root, { agent: noCli, checks }), 2)
+  assert.deepEqual(read(root).groups[1].workspace, workspace)
+  assert.equal(fs.readFileSync(path.join(workspace.worktree, 'archive.txt'), 'utf8'), 'unfinished dependent edit\n')
+  const broken = read(root); delete broken.groups[0].integration; write(root, broken)
+  await assert.rejects(L.run(root, { agent: noCli, checks }), /Completed group lacks checked integration proof/)
+  assert.equal(fs.readFileSync(path.join(workspace.worktree, 'archive.txt'), 'utf8'), 'unfinished dependent edit\n')
+  write(root, paused)
+  finish(handoff)
+  assert.equal(await L.run(root, { agent: noCli, checks }), 0)
+  assert.deepEqual(read(root).groups[1].workspace, workspace)
+})
+
+test('dependent starts against latest forward target after its ancestor integrates', { timeout: 30000 }, async () => {
+  const { root, repo, q } = fixture([['a.txt'], ['archive.txt']])
+  q.groups[1].depends_on = ['G1']; write(root, q)
+  let moved = false
+  assert.equal(await L.run(root, { agent, checks, on_save: saved => {
+    if (moved || saved.groups[0].state !== 'done') return
+    moved = true
+    fs.writeFileSync(path.join(repo, 'outside.txt'), 'owner history\n')
+    git(repo, 'add', 'outside.txt'); git(repo, 'commit', '-m', 'owner move')
+  } }), 0)
+  assert.ok(read(root).groups[1].workspace)
+  assert.equal(read(root).target_adoptions.length, 1)
+  const unproved = read(root); delete unproved.groups[0].integration; write(root, unproved)
+  await assert.rejects(L.run(root, { agent, checks }), /Completed group lacks checked integration proof/)
+  assert.ok(read(root).groups[1].workspace)
+})
+
+for (const outcome of ['blocked', 'repair', 'needs_owner']) test(`answered CLI ${outcome} creates a fresh task attempt while retaining stopped evidence`, { timeout: 30000 }, async () => {
+  const { root, repo } = fixture([['a.txt']])
+  let original, savedResult, calls = 0, marker, product
+  assert.equal(await L.run(root, { checks, agent: async args => {
+    calls++; original = structuredClone(args.attempt)
+    fs.mkdirSync(args.attempt_dir, { recursive: true })
+    product = path.join(args.cwd, 'a.txt')
+    fs.writeFileSync(product, 'preserved unfinished product\n')
+    marker = path.join(args.cwd, '.aglite-records/.devlog.md.owner')
+    fs.writeFileSync(marker, JSON.stringify({ session: original.id }))
+    const response = result(args.attempt, outcome)
+    savedResult = JSON.stringify(response)
+    fs.writeFileSync(path.join(args.attempt_dir, 'result.json'), savedResult)
+    fs.writeFileSync(path.join(args.attempt_dir, 'exit.json'), JSON.stringify({ exit_code: 0, aborted: false, timed_out: false }))
+    return response
+  } }), 2)
+  const blocked = read(root), question = blocked.questions[0]
+  assert.equal(fs.existsSync(marker), false)
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'attempts', original.id, 'notebook-owner.released.json'))).session, original.id)
+  const forbidden = async () => { calls++; throw Error('Unanswered blocked attempt repeated') }
+  assert.equal(await L.run(root, { checks, agent: forbidden }), 2)
+  assert.equal(calls, 1)
+  answer(root, question, 'host')
+  if (outcome === 'needs_owner') {
+    await assert.rejects(L.run(root, { checks, agent: forbidden }), /actual owner answer/)
+    assert.equal(calls, 1)
+    answer(root, question, 'owner')
+  }
+  assert.equal(await L.run(root, { checks, agent: async args => {
+    calls++
+    assert.notEqual(args.attempt.id, original.id)
+    assert.match(args.prompt, /Correction supplied; continue/)
+    assert.ok(args.prompt.includes(`Use generated workflow session UUID ${args.attempt.id}`))
+    assert.equal(args.prompt.includes(`Use generated workflow session UUID ${original.id}`), false)
+    assert.equal(fs.readFileSync(product, 'utf8'), 'preserved unfinished product\n')
+    assert.equal(fs.existsSync(marker), false)
+    fs.writeFileSync(product, 'preserved unfinished product\ncompleted correction\n')
+    closeout(args.cwd)
+    return result(args.attempt)
+  } }), 0)
+  assert.equal(calls, 2)
+  assert.equal(fs.readFileSync(path.join(repo, 'a.txt'), 'utf8'), 'preserved unfinished product\ncompleted correction\n')
+  assert.equal(fs.readFileSync(path.join(root, 'attempts', original.id, 'result.json'), 'utf8'), savedResult)
+  assert.deepEqual(read(root).groups[0].tasks[0].result.outcome, 'pass')
+})
+
+for (const [outcome, prior_answer] of [['blocked', false], ['needs_owner', false], ['needs_owner', true]]) test(`crashed CLI ${outcome} imports its blocker without retry${prior_answer ? ' despite an older answered question' : ''}`, { timeout: 30000 }, async () => {
+  const { root } = fixture([['a.txt']])
+  let calls = 0, crash_image, crashed_attempt
+  const stopped = async args => {
+    calls++
+    fs.mkdirSync(args.attempt_dir, { recursive: true })
+    const current = prior_answer && calls === 1 ? 'blocked' : outcome
+    const response = result(args.attempt, current)
+    fs.writeFileSync(path.join(args.cwd, 'a.txt'), 'unfinished crash-window product\n')
+    fs.writeFileSync(path.join(args.attempt_dir, 'result.json'), JSON.stringify(response))
+    fs.writeFileSync(path.join(args.attempt_dir, 'exit.json'), JSON.stringify({ exit_code: 0, aborted: false, timed_out: false }))
+    if (!prior_answer || calls === 2) crashed_attempt = args.attempt.id
+    return response
+  }
+  const capture = q => {
+    if (!crashed_attempt || crash_image || q.groups[0].state !== 'working' || q.groups[0].attempt?.id !== crashed_attempt) return
+    crash_image = structuredClone(q) // Durable image after transport stop, before collect records the question.
+  }
+  assert.equal(await L.run(root, { checks, agent: stopped, on_save: capture }), 2)
+  if (prior_answer) {
+    answer(root, read(root).questions[0], 'host')
+    assert.equal(await L.run(root, { checks, agent: stopped, on_save: capture }), 2)
+  }
+  assert.ok(crash_image)
+  assert.equal(crash_image.questions.filter(q => !q.answer).length, 0)
+  assert.equal(crash_image.groups[0].retry_attempt, undefined)
+  write(root, crash_image)
+  const before = calls
+  assert.equal(await L.run(root, { checks, agent: async () => { calls++; throw Error('Crashed nonpass retried without answer') } }), 2)
+  assert.equal(calls, before)
+  const saved = read(root), question = saved.questions.find(q => !q.answer)
+  assert.equal(saved.groups[0].state, 'blocked')
+  assert.equal(saved.groups[0].attempt.id, crashed_attempt)
+  assert.equal(question.requires_owner, outcome === 'needs_owner')
+  assert.equal(fs.readFileSync(path.join(saved.groups[0].workspace.worktree, 'a.txt'), 'utf8'), 'unfinished crash-window product\n')
+})
+
+
+test('configuration discovery selects deeply nested ag-dir and passes its exact inherited path', async () => {
+  const { root, repo } = fixture([['a.txt']])
+  const relative = 'docs/agent/records/one/two/notes/ag.json'
+  const old = path.join(repo, '.agentflow/ag.json'), file = path.join(repo, relative)
+  const config = JSON.parse(fs.readFileSync(old))
+  config.switches = { ...config.switches, 'ag-dir': path.posix.dirname(relative) }
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  git(repo, 'mv', '.agentflow/ag.json', relative)
+  fs.writeFileSync(file, JSON.stringify(config))
+  git(repo, 'add', relative); git(repo, 'commit', '-m', 'custom configuration')
+  const queue = read(root); queue.base_commit = git(repo, 'rev-parse', 'HEAD'); write(root, queue)
+  // Bundled source, nested checkout and isolated record configs are not this config.
+  for (const [directory, ag_dir] of [['skills/example/assets/.agentflow', '.agentflow'],
+    ['.wts/other/notes', '.wts/other/notes'], ['.aglite-records', '.aglite-records']]) {
+    fs.mkdirSync(path.join(repo, directory), { recursive: true })
+    fs.writeFileSync(path.join(repo, directory, 'ag.json'), JSON.stringify({ switches: { 'ag-dir': ag_dir } }))
+  }
+  fs.writeFileSync(path.join(repo, '.wts/other/.git'), 'gitdir: elsewhere')
+  const settings = L.read_settings(repo)
+  assert.equal(settings.file, relative)
+  assert.equal(L.select(settings, 'task').source.file, relative)
+  assert.equal(await L.run(root, { checks, agent: async args => {
+    assert.ok(args.prompt.includes(`read inherited configuration only at ${path.join(args.cwd, relative)}`))
+    assert.ok(args.prompt.includes('record-only session override'))
+    assert.ok(fs.existsSync(path.join(args.cwd, relative)))
+    task_edit(args); return result(args.attempt)
+  } }), 0)
+})
+
+test('configuration collisions and legacy locations fail before claims or writes', async () => {
+  const { root, repo } = fixture([['a.txt']])
+  const canonical = path.join(repo, '.agentflow/ag.json'), legacy = path.join(repo, 'ag.json')
+  const bytes = fs.readFileSync(canonical), queue = fs.readFileSync(path.join(root, 'queue.json'))
+  fs.writeFileSync(legacy, bytes)
+  await assert.rejects(L.run(root, { agent, checks }), /Configuration collision/)
+  assert.deepEqual(fs.readFileSync(canonical), bytes)
+  assert.deepEqual(fs.readFileSync(legacy), bytes)
+  assert.equal(fs.existsSync(path.join(root, '.queue.owner')), false)
+  assert.deepEqual(fs.readFileSync(path.join(root, 'queue.json')), queue)
+  fs.renameSync(legacy, path.join(repo, 'saved-root.json'))
+  const config = JSON.parse(bytes); config.switches = { 'ag-dir': 'notes' }; config['schema-version'] = 10
+  fs.writeFileSync(canonical, JSON.stringify(config))
+  await assert.rejects(L.run(root, { agent, checks }), /Legacy configuration.*relocate to <ag-dir>/)
+  fs.mkdirSync(path.join(repo, 'notes'))
+  config['schema-version'] = current_schema
+  fs.writeFileSync(path.join(repo, 'notes/ag.json'), JSON.stringify(config))
+  await assert.rejects(L.run(root, { agent, checks }), /Configuration collision/)
+  config['schema-version'] = current_schema
+  fs.writeFileSync(canonical, JSON.stringify(config))
+  await assert.rejects(L.run(root, { agent, checks }), /Misplaced configuration.*owner reconciliation/)
+  // Both canonical candidates also conflict even if each is valid independently.
+  fs.writeFileSync(canonical, bytes)
+  await assert.rejects(L.run(root, { agent, checks }), /Configuration collision/)
+  assert.equal(fs.existsSync(path.join(root, '.queue.owner')), false)
+  assert.deepEqual(fs.readFileSync(path.join(root, 'queue.json')), queue)
+})
+
+test('current config requires the bundled schema and safe ag-dir, without rewriting source', () => {
+  const { repo } = fixture([['a.txt']])
+  const file = path.join(repo, '.agentflow/ag.json'), original = fs.readFileSync(file)
+  for (const version of [9, 10, 11, 12, 'aglite-5', String(current_schema), current_schema + 1]) {
+    const config = JSON.parse(original); config['schema-version'] = version
+    const bytes = JSON.stringify(config); fs.writeFileSync(file, bytes)
+    assert.throws(() => L.read_settings(repo), new RegExp(`migrate to integer ${current_schema}`))
+    assert.equal(fs.readFileSync(file, 'utf8'), bytes)
+  }
+  for (const value of ['../escape', '/absolute', '', null, 42]) {
+    const config = JSON.parse(original); config.switches = { 'ag-dir': value }
+    fs.writeFileSync(file, JSON.stringify(config))
+    assert.throws(() => L.read_settings(repo), /relative path|Unsafe path/)
+  }
+  const config = JSON.parse(original); delete config['schema-version']
+  fs.writeFileSync(file, JSON.stringify(config)); assert.doesNotThrow(() => L.read_settings(repo))
+})
+
+test('saving-mode accepts exact on/off and refuses missing or invalid values before claims', async () => {
+  const { root, repo } = fixture([['a.txt']])
+  const file = path.join(repo, '.agentflow/ag.json'), original = fs.readFileSync(file)
+  const queue = fs.readFileSync(path.join(root, 'queue.json'))
+  for (const value of ['on', 'off']) {
+    const config = JSON.parse(original); config.switches['saving-mode'] = value
+    const bytes = JSON.stringify(config); fs.writeFileSync(file, bytes)
+    assert.equal(L.read_settings(repo).config.switches['saving-mode'], value)
+    assert.equal(fs.readFileSync(file, 'utf8'), bytes)
+  }
+  for (const value of [undefined, null, true, false, '', 'ON', 'auto', 0]) {
+    const config = JSON.parse(original)
+    if (value === undefined) delete config.switches['saving-mode']
+    else config.switches['saving-mode'] = value
+    const bytes = JSON.stringify(config); fs.writeFileSync(file, bytes)
+    await assert.rejects(L.run(root, { agent: async () => assert.fail('must not dispatch'), checks }),
+      value === undefined ? /saving-mode missing.*migrate/ : /saving-mode must be on or off/)
+    assert.equal(fs.readFileSync(file, 'utf8'), bytes)
+    assert.deepEqual(fs.readFileSync(path.join(root, 'queue.json')), queue)
+    assert.equal(fs.existsSync(path.join(root, '.queue.owner')), false)
+    assert.equal(fs.readdirSync(path.join(repo, '.git')).filter(name => /^aglite-target-.*\.owner$/.test(name)).length, 0)
+    assert.equal(fs.existsSync(path.join(repo, '.wts')), false)
   }
 })
 
-test('owner release quarantines a replacement after the final verification and reports the retired path', async () => {
-  const dir = make_temp_dir('agentflow-looper-retired-replacement')
-  try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    write_plan(queue, 'plan-001.md')
-    const replacement = Buffer.from('{"owner_token":"replacement-owner","pid":1}\n')
-    let retired_path
-    const result = await run_looper(base_options(queue, fake_child, {}, {
-      before_release_move: ({ source, destination }) => {
-        retired_path = destination
-        fs.renameSync(source, `${source}.original`)
-        fs.mkdirSync(source)
-        fs.writeFileSync(path.join(source, 'owner.json'), replacement)
-      },
-    }))
-
-    assert.notEqual(result.code, 0)
-    assert.match(result.message, /retired|recovery|ownership/i)
-    assert.ok(retired_path)
-    assert.equal(fs.existsSync(lock_path(queue)), false)
-    assert.deepEqual(fs.readFileSync(path.join(retired_path, 'owner.json')), replacement)
-    assert.equal(fs.existsSync(`${lock_path(queue)}.original`), true)
-  } finally {
-    remove_temp_dir(dir)
+test('canonical configuration refuses symlinked directories and files', t => {
+  for (const directory of [true, false]) {
+    const { repo } = fixture([['a.txt']])
+    const file = path.join(repo, '.agentflow/ag.json')
+    if (directory) {
+      const saved = path.join(repo, 'saved-config')
+      fs.renameSync(path.dirname(file), saved)
+      if (!symlink_or_skip(t, saved, path.dirname(file), 'junction')) return
+    } else {
+      const saved = path.join(repo, '.agentflow/saved.json')
+      fs.renameSync(file, saved)
+      if (!symlink_or_skip(t, saved, file)) return
+    }
+    assert.throws(() => L.read_settings(repo), /Symlink path refused/)
   }
 })
 
-test('archive retains a hidden recovery hard link beside the final destination', async () => {
-  const dir = make_temp_dir('agentflow-looper-archive-recovery')
-  try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    write_plan(queue, 'plan-001.md', 'recoverable plan')
-    const result = await run_looper(base_options(queue, fake_child))
-    const destination = path.join(queue, 'done', 'plan-001.md')
-    const recovery_entries = fs.readdirSync(path.join(queue, 'done')).filter((name) => name.startsWith('.looper-recovery-'))
-    const attempt = read_json(attempt_path(queue))
+test('unresolved custom configs and symlinks never silently select defaults', t => {
+  const { repo } = fixture([['a.txt']])
+  const file = path.join(repo, '.agentflow/ag.json')
+  fs.renameSync(file, path.join(repo, '.agentflow/saved.json'))
+  fs.mkdirSync(path.join(repo, 'custom'))
+  const custom = path.join(repo, 'custom/ag.json')
+  fs.writeFileSync(custom, '{ invalid')
+  assert.throws(() => L.read_settings(repo), /No canonical.*custom\/ag.json/)
+  fs.renameSync(custom, path.join(repo, 'custom/saved.json'))
+  if (!symlink_or_skip(t, path.join(repo, 'custom/saved.json'), custom)) return
+  assert.throws(() => L.read_settings(repo), /Symlink path refused/)
+})
 
-    assert.equal(result.code, 0)
-    assert.equal(recovery_entries.length, 1)
-    assert.equal(attempt.recovery_path, path.join(fs.realpathSync(queue), 'done', recovery_entries[0]))
-    assert.equal(fs.statSync(attempt.recovery_path).ino, fs.statSync(destination).ino)
-    assert.equal(fs.readFileSync(attempt.recovery_path, 'utf8'), 'recoverable plan\n')
-    assert.equal(fs.existsSync(path.join(queue, 'plan-001.md')), false)
-  } finally {
-    remove_temp_dir(dir)
+
+test('CRLF task and closeout readers preserve original bytes and reject mixed duplicate headings', () => {
+  const { root, repo } = fixture([['T-001', 'T-002']])
+  const q = read(root), group = q.groups[0], task = group.tasks[0]
+  const file = path.join(root, group.file)
+  const source = fs.readFileSync(file, 'utf8').replace(/\r?\n/g, '\r\n')
+  fs.writeFileSync(file, source)
+  const hash = q.request_sha256
+  L.validate(q, root)
+  const expected = source.slice(source.indexOf(`## ${task.id}\r\n`)).split(/\r\n## /)[0]
+  assert.equal(L.task_text(root, group, task), expected)
+  assert.equal(q.request_sha256, hash)
+  fs.appendFileSync(file, `\n## ${task.id}\nDuplicate\n`)
+  assert.throws(() => L.validate(q, root), /duplicate task section/)
+  assert.throws(() => L.task_text(root, group, task), /duplicate/)
+  fs.mkdirSync(path.join(repo, '.aglite-records'))
+  fs.writeFileSync(path.join(repo, '.aglite-records/devlog.md'), '# → Ask / A-001\r\n\r\n# → Reply / A-001\r\n\r\nClosed\r\n\r\n# → Ask / A-002\r\n')
+  assert.equal(L.ordinary_closeout(repo, {}), 1)
+})
+
+test('reserved task directories are case insensitive while Unix filenames stay valid', () => {
+  const S = require('./looper-state')
+  for (const name of ['a:b', 'x.', 'x ', 'CON.txt', 'com¹.log', 'LPT9', 'CONIN$', 'bad?', 'bad\x01'])
+    assert.equal(S.windows_component(name), false, name)
+  for (const name of ['normal.txt', 'GIT~1', 'context', 'com10', '~1']) assert.equal(S.windows_component(name), true, name)
+  const { root, repo } = fixture([['T-001']])
+  const q = read(root)
+  for (const name of ['.GIT/x', '.Wts/x', '.AGLITE-records/x']) {
+    q.groups[0].tasks[0].allowed_paths = [name]
+    assert.throws(() => L.validate(q, root), /Reserved task path/)
+  }
+  if (process.platform !== 'win32')
+    for (const name of ['a:b', 'x.', 'x ', 'CON.txt', 'GIT~1']) assert.equal(S.safe_path(repo, name), path.join(repo, name))
+})
+
+test('Windows executable resolution preserves wrapper argv and refuses ambiguous logic/cwd lookup', () => {
+  const { resolve_command } = require('./looper-agent')
+  // Independent fixture for cmd-shim's generated template, not a fake native CLI.
+  const wrapper = '@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\r\nIF EXIST "%dp0%\\node.exe" (\r\n  SET "_prog=%dp0%\\node.exe"\r\n) ELSE (\r\n  SET "_prog=node"\r\n  SET PATHEXT=%PATHEXT:;.JS;=;%\r\n)\r\n\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%" "%dp0%\\node_modules\\tool\\cli.js" %*\r\n'
+  const files = new Map([['C:\\bin\\tool.CMD', wrapper], ['C:\\bin\\node_modules\\tool\\cli.js', ''], ['C:\\node\\node.exe', ''], ['C:\\cwd\\planted.EXE', '']])
+  const options = { platform: 'win32', env: { Path: '.;C:\\bin;C:\\node', PATHEXT: '.EXE;.CMD' }, cwd: 'C:\\work', exists: name => files.has(name), read: name => files.get(name), node: 'C:\\known\\node.exe' }
+  const argv = ['a b', '"quoted"', '& echo bad', '%PATH%', '繁體\n😀']
+  assert.deepEqual(resolve_command(['tool', ...argv], options), ['C:\\known\\node.exe', 'C:\\bin\\node_modules\\tool\\cli.js', ...argv])
+  files.set('C:\\bin\\node.exe', '')
+  assert.equal(resolve_command(['tool'], options)[0], 'C:\\bin\\node.exe')
+  assert.deepEqual(resolve_command(['C:\\explicit\\entry.js', ...argv], options), ['C:\\known\\node.exe', 'C:\\explicit\\entry.js', ...argv])
+  const local = wrapper.replace('node_modules\\tool\\cli.js', '..\\tool\\cli.js').replace('"%_prog%" "', '"%_prog%"  "')
+  files.set('C:\\work\\node_modules\\.bin\\tool.cmd', local)
+  files.set('C:\\work\\node_modules\\tool\\cli.js', '')
+  assert.deepEqual(resolve_command(['./node_modules/.bin/tool.cmd', ...argv], options), ['C:\\known\\node.exe', 'C:\\work\\node_modules\\tool\\cli.js', ...argv])
+  const current = local.replace('  SET PATHEXT=%PATHEXT:;.JS;=;%\r\n', '')
+    .replace('& "%_prog%"', '& set PATHEXT=%PATHEXT:;.JS;=;% & "%_prog%"')
+  files.set('C:\\work\\node_modules\\.bin\\tool.cmd', current)
+  assert.equal(resolve_command(['./node_modules/.bin/tool.cmd'], options)[1], 'C:\\work\\node_modules\\tool\\cli.js')
+  assert.deepEqual(resolve_command(['./verify.js', ...argv], options), ['C:\\known\\node.exe', 'C:\\work\\verify.js', ...argv])
+  assert.throws(() => resolve_command(['C:verify.js'], options), /Drive-relative/)
+  files.set('C:\\bin\\tool.CMD', wrapper.replace('%*', '--hidden %*'))
+  assert.throws(() => resolve_command(['tool'], options), /Unsupported Windows wrapper.*native .exe/)
+  files.set('C:\\bin\\npm.CMD', '@echo off\r\ncall npm-prefix.js\r\n')
+  assert.throws(() => resolve_command(['npm'], options), /prefix\/custom wrapper logic is unsupported/)
+  assert.throws(() => resolve_command(['planted'], options), /not found/)
+  for (const name of ['C:\\bin\\custom.bat', 'C:\\bin\\custom.ps1', 'C:\\bin\\extensionless']) {
+    files.set(name, 'echo surprise')
+    assert.throws(() => resolve_command([name], options), /Unsupported Windows wrapper/)
   }
 })
 
-test('archive moves a source replacement to recovery and stops without discarding it', async () => {
-  const dir = make_temp_dir('agentflow-looper-archive-source-replacement')
-  try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    write_plan(queue, 'plan-001.md', 'original plan')
-    let recovery_path
-    const result = await run_looper(base_options(queue, fake_child, {}, {
-      before_archive_source_move: ({ source, recovery_path: selected_recovery }) => {
-        recovery_path = selected_recovery
-        fs.renameSync(source, `${source}.original`)
-        fs.writeFileSync(source, 'replacement plan\n')
-      },
-    }))
+test('Windows ancestry compares full creation ticks and retains evidence on malformed enumeration', () => {
+  const { observe_descendants } = require('./looper-agent')
+  const tracked = new Map(), tick = '638000000000000001'
+  const scan = snapshot => observe_descendants(10, tracked, `win32:${tick}`, { platform: 'win32', snapshot })
+  const children = scan(`10 1 0 ${tick}\r\n11 10 0 638000000000000000\r\n12 10 0 ${tick}\r\n13 12 0 638000000000000002\r\n14 12 0 638000000000000000`)
+  assert.deepEqual(children.map(child => child.pid), [12, 13])
+  const before = [...tracked]
+  assert.throws(() => scan(`10 1 0 ${tick}\nmalformed`), error => error.unsettled === true)
+  assert.deepEqual([...tracked], before)
+  assert.throws(() => scan(''), error => error.unsettled === true)
+  assert.deepEqual([...tracked], before)
+})
 
-    assert.notEqual(result.code, 0)
-    assert.match(result.message, /recovery evidence/i)
-    assert.ok(recovery_path)
-    assert.equal(fs.existsSync(recovery_path), true)
-    assert.equal(fs.readFileSync(recovery_path, 'utf8'), 'replacement plan\n')
-    assert.equal(fs.existsSync(path.join(queue, 'plan-001.md.original')), true)
-    assert.equal(fs.existsSync(path.join(queue, 'done', 'plan-001.md')), false)
-    assert.equal(read_json(attempt_path(queue)).recovery_path, recovery_path)
-  } finally {
-    remove_temp_dir(dir)
+test('process enumeration failure makes execution unsettled and preserves recorded process evidence', async () => {
+  const { execute } = require('./looper-agent')
+  const S = require('./looper-state')
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'aglite-process-unknown-')))
+  const claim_file = path.join(root, 'claim.json'), claim = S.acquire_claim(claim_file)
+  const process_file = path.join(root, 'process.json')
+  await assert.rejects(execute({ command: [process.execPath, '-e', 'setTimeout(() => {}, 150)'], cwd: root,
+    log: path.join(root, 'transcript.log'), on_launch: identity => S.write_json(process_file, identity),
+    observe: () => { throw Error('injected query timeout') } }), error => error.unsettled === true)
+  assert.equal(S.read_json(claim_file).token, claim.token)
+  const primary = S.read_json(process_file)
+  assert.ok(primary.started_at)
+  for (let i = 0; i < 100 && S.process_alive(primary) !== false; i++) await new Promise(resolve => setTimeout(resolve, 20))
+  assert.equal(S.process_alive(primary), false, 'test-owned child is proved stopped before test completion')
+  assert.ok(fs.existsSync(path.join(root, 'transcript.log')))
+})
+
+test('directory junctions are refused as task paths', () => {
+  const S = require('./looper-state')
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'aglite-junction-')))
+  fs.mkdirSync(path.join(root, 'target'))
+  fs.symlinkSync(path.join(root, 'target'), path.join(root, 'alias'), 'junction')
+  assert.throws(() => S.safe_path(root, 'alias/file'), /Symlink path refused/)
+})
+
+
+test('unknown and reused descendant identities are never signalled', () => {
+  const { signal_descendants } = require('./looper-agent')
+  const tracked = new Map([1, 2, 3, 4].map(pid => [pid, { pid, started_at: pid === 4 ? null : 'win32:100' }]))
+  const sent = []
+  signal_descendants(tracked, 'SIGKILL', { identify: pid => pid === 1 ? null : pid === 2 ? 'win32:101' : 'win32:100', send: (...args) => sent.push(args) })
+  assert.deepEqual(sent, [[3, 'SIGKILL']])
+  assert.equal(tracked.size, 4, 'unknown identities remain recorded')
+})
+
+
+test('omitted known Windows processes require independent stop proof; closed root is handle evidence only', () => {
+  const { observe_descendants } = require('./looper-agent')
+  const item = { pid: 12, started_at: 'win32:638000000000000002' }
+  const snapshot = '0 0 0 ?\r\n4 0 0 ?\r\n10 1 0 638000000000000001\r\n13 12 0 638000000000000003'
+  const tracked = new Map([[12, item]])
+  const base = { platform: 'win32', snapshot }
+  assert.throws(() => observe_descendants(10, tracked, 'win32:638000000000000001', { ...base, alive: () => 'unknown' }), error => error.unsettled === true)
+  assert.deepEqual([...tracked.values()], [item])
+  assert.deepEqual(observe_descendants(10, tracked, 'win32:638000000000000001', { ...base, alive: () => true }).map(row => row.pid), [13])
+  assert.equal(tracked.has(12), true)
+  observe_descendants(10, tracked, 'win32:638000000000000001', { ...base, alive: () => false })
+  assert.equal(tracked.has(12), false)
+  assert.throws(() => observe_descendants(99, new Map(), null, { platform: 'win32', snapshot: '99 1 0 638000000000000001', alive: () => true }), error => error.unsettled === true)
+  assert.deepEqual(observe_descendants(99, new Map(), null, { platform: 'win32', snapshot: '0 0 0 ?\n4 0 0 ?', root_stopped: true,
+    alive: () => { throw Error('closed own root must not be mistaken for an unknown live PID') } }), [])
+})
+
+
+test('POSIX process group cleanup survives immediate leader exit before ancestry polling', { skip: process.platform === 'win32' ? 'POSIX process-group guarantee; Windows uses identified descendants' : false }, async () => {
+  const { execute } = require('./looper-agent')
+  const S = require('./looper-state')
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'aglite-orphan-group-')))
+  const pid_file = path.join(root, 'child.json')
+  const source = `const { spawn } = require('node:child_process'); const fs = require('node:fs'); const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }); fs.writeFileSync(${JSON.stringify(pid_file)}, JSON.stringify({ pid: child.pid })); child.unref()`
+  let observation
+  try { observation = await execute({ command: [process.execPath, '-e', source], cwd: root, log: path.join(root, 'transcript.log') }) }
+  catch (error) { assert.equal(error.unsettled, true) }
+  const child = JSON.parse(fs.readFileSync(pid_file))
+  for (let i = 0; i < 50 && S.process_identity(child.pid); i++) await new Promise(resolve => setTimeout(resolve, 20))
+  assert.equal(S.process_identity(child.pid), null, 'orphan in the owned process group must be stopped')
+  if (observation) assert.equal(observation.exit_code, 0)
+})
+
+test('CRLF Git exclude rules are recognized without rewriting or appending bytes', () => {
+  const G = require('./looper-integration')
+  const { q } = fixture([['a.txt']])
+  q.expected_head = q.base_commit
+  const group = q.groups[0], cwd = G.prepare_group(q, group, () => {})
+  const exclude = path.resolve(cwd, G.git(cwd, ['rev-parse', '--git-path', 'info/exclude']))
+  const original = Buffer.from('# owner excludes\r\n/.aglite-records/\r\n/.aglite-records/.devlog.md.owner\r\n')
+  fs.writeFileSync(exclude, original)
+  G.prepare_group(q, group, () => {})
+  G.prepare_group(q, group, () => {})
+  assert.deepEqual(fs.readFileSync(exclude), original)
+})
+
+test('ordinary closeout proves localized phase sequence without reading labels', () => {
+  const cwd = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'aglite-locale-closeout-')))
+  fs.mkdirSync(path.join(cwd, '.aglite-records'))
+  const file = path.join(cwd, '.aglite-records/devlog.md')
+  for (const [ask, reply] of [['Ask', 'Reply'], ['提問', '回覆'], ['質問', '回答']]) {
+    const first = `# → ${ask} / A-001 (owner)`
+    const answer = `# → ${reply} / A-001`
+    const next = `# → ${ask} / A-002`
+    const valid = [first, answer, next]
+    for (const newline of ['\n', '\r\n']) {
+      fs.writeFileSync(file, valid.join(newline + newline) + newline)
+      assert.equal(L.ordinary_closeout(cwd, {}), 1)
+      assert.throws(() => L.ordinary_closeout(cwd, { previous_round: 1 }))
+    }
+    for (const invalid of [
+      [first, next], [first, answer], [first, first, next], [first, answer, answer, next],
+      [first, answer, next, `# → ${ask} / A-3`],
+      [first, answer, `# → ${ask} / A-003`],
+      [first, next, answer], [first, answer, next, answer],
+      [first, answer, `# → ${reply} / A-002`],
+      [first, '```md', answer, '```', next],
+      [first, '~~~', answer, '~~~', next],
+      [first, `> ${answer}`, next], [first, `    ${answer}`, next]
+    ]) {
+      fs.writeFileSync(file, invalid.join('\n\n'))
+      assert.throws(() => L.ordinary_closeout(cwd, {}), invalid.join(' | '))
+    }
   }
 })
 
-test('archive preserves a destination replacement at the cleanup boundary', async () => {
-  const dir = make_temp_dir('agentflow-looper-archive-destination-replacement')
-  try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    write_plan(queue, 'plan-001.md', 'original plan')
-    let recovery_path
-    const destination = path.join(queue, 'done', 'plan-001.md')
-    const result = await run_looper(base_options(queue, fake_child, {}, {
-      before_destination_cleanup: ({ recovery_path: selected_recovery, destination: selected_destination }) => {
-        recovery_path = selected_recovery
-        fs.renameSync(selected_destination, `${selected_destination}.original`)
-        fs.writeFileSync(selected_destination, 'replacement destination\n')
-      },
-    }))
-
-    assert.notEqual(result.code, 0)
-    assert.match(result.message, /recovery evidence/i)
-    assert.ok(recovery_path)
-    assert.equal(fs.readFileSync(destination, 'utf8'), 'replacement destination\n')
-    assert.equal(fs.existsSync(`${destination}.original`), true)
-    assert.equal(fs.existsSync(recovery_path), true)
-    assert.equal(fs.statSync(`${destination}.original`).ino, fs.statSync(recovery_path).ino)
-    assert.equal(fs.existsSync(path.join(queue, 'plan-001.md')), false)
-  } finally {
-    remove_temp_dir(dir)
-  }
+test('real Git localized task host creates its notebook and receives exact ownership facts', { timeout: 30000 }, async () => {
+  const { root, repo } = fixture([['a.txt']])
+  const config = path.join(repo, '.agentflow/ag.json')
+  const settings = JSON.parse(fs.readFileSync(config))
+  settings.switches = { ...settings.switches, 'use-lang': 'zh-TW' }
+  fs.writeFileSync(config, JSON.stringify(settings))
+  git(repo, 'add', '.agentflow/ag.json'); git(repo, 'commit', '-m', 'locale fixture')
+  const q = read(root); q.base_commit = git(repo, 'rev-parse', 'HEAD'); write(root, q)
+  // Call the real runner directly: the fake task host performs its own rendering.
+  assert.equal(await real_run(root, { checks, agent: async args => {
+    if (args.role !== 'task') return result(args.attempt)
+    const file = path.join(args.cwd, '.aglite-records/devlog.md')
+    assert.equal(fs.existsSync(file), false, 'coordinator creates no English scaffold')
+    assert.equal(args.attempt.previous_round, 0)
+    assert.ok(args.prompt.includes(`UUID ${args.attempt.id}`))
+    assert.ok(args.prompt.includes(`project fixture/G1; notebook .aglite-records/devlog.md`))
+    assert.ok(args.prompt.includes(`checkout ${args.cwd}; branch ${git(args.cwd, 'branch', '--show-current')}.`))
+    assert.match(args.prompt, /switches.use-lang/)
+    fs.writeFileSync(file, `# 狀態\n\n專案：fixture/G1\n\n筆記本：.aglite-records/devlog.md\n\n工作目錄：${args.cwd}\n\n分支：${git(args.cwd, 'branch', '--show-current')}\n\n目前：A-002\n\n已證實：A-001\n\n下一步：等待任務\n\n已封存時期：無\n\n# → 提問 / A-001\n\n# → 回覆 / A-001\n\n已完成。\n\n# → 提問 / A-002\n`)
+    fs.writeFileSync(path.join(args.cwd, '.aglite-records/.devlog.md.owner'), JSON.stringify({ session: args.attempt.id }))
+    fs.writeFileSync(path.join(args.cwd, 'a.txt'), '完成\n')
+    return result(args.attempt)
+  } }), 0)
+  assert.equal(read(root).groups[0].tasks[0].round, 1)
 })
 
-test('two concurrent runners start at most one child', async () => {
-  const dir = make_temp_dir('agentflow-looper-race')
-  try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    const launch_log = path.join(dir, 'launch.jsonl')
-    write_plan(queue, 'plan-001.md')
-    const options = base_options(queue, fake_child, { delay: 120, launch_log })
-    const [first, second] = await Promise.all([run_looper(options), run_looper(options)])
-    assert.equal([first.code, second.code].filter((code) => code === 0).length, 1)
-    assert.equal(read_json_lines(launch_log).length, 1)
-  } finally {
-    remove_temp_dir(dir)
-  }
+test('saved task with a missing notebook blocks resume without recreating or dispatching', { timeout: 30000 }, async () => {
+  const { root } = fixture([['a.txt']])
+  assert.equal(await L.run(root, { checks, agent: async args => {
+    fs.mkdirSync(args.attempt_dir, { recursive: true })
+    const response = result(args.attempt)
+    fs.writeFileSync(path.join(args.attempt_dir, 'exit.json'), JSON.stringify({ exit_code: 0 }))
+    fs.writeFileSync(path.join(args.attempt_dir, 'result.json'), JSON.stringify(response))
+    fs.writeFileSync(path.join(args.cwd, 'a.txt'), 'product completed\n')
+    return response // Deliberately leaves ordinary closeout unfinished.
+  } }), 2)
+  const saved = read(root)
+  const file = path.join(saved.groups[0].workspace.worktree, '.aglite-records/devlog.md')
+  fs.renameSync(file, file + '.preserved')
+  answer(root, saved.questions[0], 'host')
+  let dispatched = false
+  await assert.rejects(real_run(root, { checks, agent: async () => { dispatched = true; throw Error('must not dispatch') } }), /Active isolated notebook is missing/)
+  assert.equal(dispatched, false)
+  assert.equal(fs.existsSync(file), false)
+  assert.equal(read(root).groups[0].attempt.id, saved.groups[0].attempt.id)
 })
 
-test('all nine lifecycle crash boundaries preserve conservative recovery', async () => {
-  const phases = [
-    'ownership-acquired',
-    'identity-recorded',
-    'launch-intent-recorded',
-    'child-started',
-    'child-exited',
-    'completion-verified',
-    'identity-rechecked',
-    'archive-moved',
-    'completed-state-written',
-  ]
+for (const native of [false, true]) test(`lost initialized ${native ? 'native' : 'CLI'} notebook cannot be recreated by an owner answer`, { timeout: 30000 }, async () => {
+  const { root } = fixture([['a.txt']], native ? { task: { ...selection, kind: 'native' } } : {})
+  let calls = 0
+  const worker = async args => { calls++; return result(args.attempt, 'needs_owner') }
+  assert.equal(await L.run(root, { checks, agent: worker }), 2)
+  if (native) {
+    const handoff = read(root).handoffs[0]
+    render_notebook(handoff.cwd)
+    fs.mkdirSync(path.join(root, 'inbox'), { recursive: true })
+    fs.writeFileSync(path.join(root, 'inbox', `${handoff.id}.json`), JSON.stringify({ ...result({ id: handoff.id }, 'needs_owner'), writer_stopped: true }))
+    assert.equal(await L.run(root, { checks, agent: worker }), 2)
+  }
+  const saved = read(root)
+  const file = path.join(saved.groups[0].workspace.worktree, '.aglite-records/devlog.md')
+  fs.renameSync(file, file + '.preserved')
+  if (!native) { delete saved.groups[0].notebook_initialized; write(root, saved) } // Existing CLI record without the new observation fact.
+  answer(root, saved.questions[0]) // Omitted source follows the ordinary owner inbox path.
+  await assert.rejects(real_run(root, { checks, agent: async () => { calls++; throw Error('must not redispatch') } }), /Active isolated notebook is missing/)
+  assert.equal(calls, native ? 0 : 1)
+  assert.equal(fs.existsSync(file), false)
+  assert.equal(read(root).groups[0].attempt.id, saved.groups[0].attempt.id)
+})
 
-  for (const phase of phases) {
-    const dir = make_temp_dir(`agentflow-looper-crash-${phase}`)
-    try {
-      const queue = make_queue()
-      const fake_child = make_fake_child(dir)
-      const launch_log = path.join(dir, 'launch.jsonl')
-      write_plan(queue, 'plan-001.md')
-      const options = base_options(queue, fake_child, { launch_log }, { crash_at: phase })
-      const crashed = await run_looper(options)
-      assert.notEqual(crashed.code, 0, phase)
-      assert.equal(fs.existsSync(lock_path(queue)), true, phase)
-      if (phase === 'ownership-acquired') {
-        const owner = read_json(path.join(lock_path(queue), 'owner.json'))
-        assert.match(owner.owner_token, /^[0-9a-f]{64}$/)
-        assert.equal(owner.canonical_queue, fs.realpathSync(queue))
-        assert.equal(owner.protected_state_path, protected_state_dir(queue))
+test('native initial pending absence is valid, but observed initialized notebook loss blocks waiting', { timeout: 30000 }, async () => {
+  const { root } = fixture([['a.txt'], ['b.txt']], { task: { ...selection, kind: 'native' }, max_workers: 1 })
+  assert.equal(await real_run(root, { checks }), 2)
+  const initial = read(root), handoff = initial.handoffs[0]
+  const file = path.join(handoff.cwd, '.aglite-records/devlog.md')
+  assert.equal(fs.existsSync(file), false)
+  assert.equal(fs.statSync(path.dirname(file)).isDirectory(), true)
+  assert.equal(await real_run(root, { checks }), 2)
+  assert.equal(read(root).groups[0].state, 'native')
+  render_notebook(handoff.cwd)
+  assert.equal(await real_run(root, { checks }), 2) // Coordinator observes initialization.
+  fs.renameSync(file, file + '.preserved')
+  assert.equal(await real_run(root, { checks }), 2)
+  assert.equal(read(root).groups[0].state, 'blocked')
+  assert.match(read(root).questions.at(-1).question, /Active isolated notebook is missing/)
+  assert.match(read(root).handoffs[0].error, /Active isolated notebook is missing/)
+  assert.match(L.status(root), /Native .*Active isolated notebook is missing/)
+  assert.equal(read(root).handoffs[0].completed, false)
+  assert.equal(read(root).handoffs.length, 1)
+  assert.equal(read(root).groups[1].workspace, undefined, 'unsettled native handoff keeps its worker slot while blocked')
+  assert.equal(fs.existsSync(file), false)
+  fs.renameSync(file + '.preserved', file)
+  assert.equal(await real_run(root, { checks }), 2)
+  assert.equal(read(root).groups[0].state, 'blocked', 'restoring bytes does not answer the recovery question')
+  assert.equal(read(root).handoffs[0].error, null)
+  answer(root, read(root).questions.at(-1), 'host')
+  assert.equal(await real_run(root, { checks }), 2)
+  assert.equal(read(root).groups[0].state, 'native', 'explicit recovery reuses its reserved slot')
+  assert.equal(read(root).handoffs.length, 1)
+  assert.equal(read(root).groups[1].workspace, undefined)
+  task_edit({ cwd: handoff.cwd, prompt: fs.readFileSync(handoff.assignment, 'utf8') })
+  fs.mkdirSync(path.join(root, 'inbox'), { recursive: true })
+  fs.writeFileSync(path.join(root, 'inbox', `${handoff.id}.json`), JSON.stringify({ ...result({ id: handoff.id }), writer_stopped: true }))
+  assert.equal(await real_run(root, { checks }), 2)
+  assert.equal(read(root).groups[0].state, 'done')
+  assert.equal(read(root).groups[0].tasks[0].result.attempt_id, handoff.id)
+})
+
+test('native saved completed round proves missing notebook even without initialization flag', { timeout: 30000 }, async () => {
+  const { root } = fixture([['a.txt']], { task: { ...selection, kind: 'native' } })
+  assert.equal(await real_run(root, { checks }), 2)
+  const saved = read(root)
+  saved.groups[0].attempt.previous_round = 1
+  delete saved.groups[0].notebook_initialized
+  write(root, saved)
+  assert.equal(await real_run(root, { checks }), 2)
+  const blocked = read(root)
+  assert.equal(blocked.groups[0].state, 'blocked')
+  assert.match(blocked.handoffs[0].error, /Active isolated notebook is missing/)
+  assert.equal(blocked.handoffs[0].completed, false)
+  assert.equal(blocked.handoffs.length, 1)
+})
+
+test('owner answer to a pre-workspace task blocker still permits first notebook creation', { timeout: 30000 }, async () => {
+  const { root, q } = fixture([['a.txt']])
+  const question = { id: crypto.randomUUID(), group_id: 'G1', kind: 'task', requires_owner: false, question: 'Worktree setup requires correction.' }
+  q.groups[0].state = 'blocked'
+  q.questions = [question]
+  write(root, q)
+  answer(root, question)
+  assert.equal(await L.run(root, { checks, agent }), 0)
+})
+
+for (const replacement of [false, true]) test(`startup notebook inspection leaves ${replacement ? 'unrelated replacement' : 'missing recorded worktree'} untouched`, { timeout: 30000 }, async () => {
+  const { root } = fixture([['a.txt']])
+  assert.equal(await L.run(root, { checks, agent: async args => result(args.attempt, 'needs_owner') }), 2)
+  const cwd = read(root).groups[0].workspace.worktree
+  fs.renameSync(cwd, cwd + '.preserved')
+  if (replacement) {
+    fs.mkdirSync(cwd)
+    fs.writeFileSync(path.join(cwd, 'unrelated.txt'), 'preserve exactly\n')
+  }
+  let dispatched = false
+  assert.equal(await real_run(root, { checks, agent: async () => { dispatched = true; throw Error('must not dispatch') } }), 2)
+  assert.equal(dispatched, false)
+  assert.equal(fs.existsSync(path.join(cwd, '.aglite-records')), false)
+  if (replacement) {
+    assert.deepEqual(fs.readdirSync(cwd), ['unrelated.txt'])
+    assert.equal(fs.readFileSync(path.join(cwd, 'unrelated.txt'), 'utf8'), 'preserve exactly\n')
+  } else assert.equal(fs.existsSync(cwd), false)
+})
+
+test('presentation observes a real checked integration without changing claims or queue authority', { timeout: 30000 }, async () => {
+  const { root, repo } = fixture([['result.txt']])
+  const R = require('./looper-report'), lines = []
+  const observer = R.observer({ write: s => lines.push(s) })
+  assert.equal(await L.run(root, { agent, checks, on_save: observer.update }), 0)
+  const saved = read(root)
+  assert.equal(saved.phase, 'complete')
+  assert.equal(saved.groups[0].state, 'done')
+  assert.equal(fs.existsSync(path.join(root, '.queue.owner')), false)
+  assert.equal(fs.readdirSync(path.join(repo, '.git')).some(name => /^aglite-target-.*\.owner$/.test(name)), false)
+  assert.ok(lines.some(line => /G1\/T1-1: checking/.test(line)))
+  const before = fs.readFileSync(path.join(root, 'queue.json'))
+  const report = R.save_report(root, observer.snapshot(), { code: 0 })
+  assert.match(report.content, /Tasks completed: 1\/1; Groups integrated: 1\/1/)
+  assert.match(report.content, /integrated target/)
+  assert.deepEqual(fs.readFileSync(path.join(root, 'queue.json')), before)
+})
+
+test('expanded status is byte-read-only with invalid worker settings and request', () => {
+  const { root, repo } = fixture([['result.txt']])
+  const config = path.join(repo, '.agentflow/ag.json')
+  fs.writeFileSync(config, '{invalid settings')
+  fs.writeFileSync(path.join(root, 'request.md'), 'changed input')
+  const inventory = directory => {
+    const list = []
+    const walk = base => {
+      for (const entry of fs.readdirSync(base, { withFileTypes: true })) {
+        const file = path.join(base, entry.name)
+        if (entry.isDirectory()) walk(file)
+        else list.push([file, crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')])
       }
-      const launches_before_restart = read_json_lines(launch_log).length
-      const restarted = await run_looper(base_options(queue, fake_child, { launch_log }))
-      assert.notEqual(restarted.code, 0, phase)
-      assert.equal(read_json_lines(launch_log).length, launches_before_restart, phase)
-      assert.equal(fs.existsSync(path.join(queue, 'done', 'plan-001.md')), phase === 'archive-moved' || phase === 'completed-state-written')
-    } finally {
-      remove_temp_dir(dir)
     }
+    walk(directory); return list
   }
+  const before = [inventory(root), inventory(repo)]
+  const output = L.status(root)
+  assert.match(output, /^Run fixture: planned\n\nTasks 0\/1; groups 0\/1\n\nTarget:/)
+  assert.match(output, /Request input blocked: Original request changed/)
+  assert.match(output, /Declared output paths/)
+  assert.deepEqual([inventory(root), inventory(repo)], before)
 })
 
-test('selected plan edit, replacement, rename, and removal stop safely', async (t) => {
-  for (const mutation of ['edit', 'replace', 'rename', 'remove']) {
-    await t.test(mutation, async () => {
-      const dir = make_temp_dir(`agentflow-looper-mutation-${mutation}`)
-      try {
-        const queue = make_queue()
-        const fake_child = make_fake_child(dir)
-        const launch_log = path.join(dir, 'launch.jsonl')
-        write_plan(queue, 'plan-001.md', 'original')
-        write_plan(queue, 'plan-002.md', 'later')
-        const result = await run_looper(base_options(queue, fake_child, { mode: 'mutate', mutation, launch_log }))
-        assert.notEqual(result.code, 0)
-        assert.match(result.message, /identity|selected plan|changed/i)
-        assert.equal(fs.existsSync(path.join(queue, 'done', 'plan-001.md')), false)
-        assert.equal(read_json_lines(launch_log).length, 1)
-        assert.ok(fs.existsSync(stop_path(queue)))
-        const restarted = await run_looper(base_options(queue, fake_child, { launch_log }))
-        assert.notEqual(restarted.code, 0)
-        assert.equal(read_json_lines(launch_log).length, 1)
-      } finally {
-        remove_temp_dir(dir)
+test('CLI interrupt reports stopped only after coordinator settlement and clears signal listeners', { timeout: 30000 }, async () => {
+  const { root } = fixture([['result.txt']])
+  const { main } = require('./agf'), stdout = [], stderr = []
+  const before = { interrupt: process.listenerCount('SIGINT'), terminate: process.listenerCount('SIGTERM') }
+  let workerStopped = false
+  const code = await main(['looper', 'run', root], {
+    stdout: { write: s => stdout.push(s) }, stderr: { write: s => stderr.push(s) },
+    run: (directory, options) => L.run(directory, { ...options, checks, agent: async args => {
+      process.emit('SIGINT')
+      assert.equal(args.signal.aborted, true)
+      workerStopped = true
+      return result(args.attempt, 'blocked')
+    } })
+  })
+  assert.equal(code, 2); assert.ok(workerStopped)
+  assert.equal(read(root).phase, 'stopped')
+  assert.equal(fs.existsSync(path.join(root, '.queue.owner')), false)
+  assert.match(stdout.join(''), /STOPPED — work preserved/)
+  assert.match(stderr.join(''), /Run phase: stopped/)
+  assert.equal(process.listenerCount('SIGINT'), before.interrupt)
+  assert.equal(process.listenerCount('SIGTERM'), before.terminate)
+})
+
+test('CLI reports the six-task blocked journey with preserved drafts and waiting ZIP', { timeout: 30000 }, async () => {
+  const { root, repo } = fixture([['joke.md', 'joke.2.md'], ['poem.md', 'poem.story.md'], ['news.md'], ['all.zip']])
+  const q = read(root); q.groups[3].depends_on = ['G1', 'G2', 'G3']; write(root, q)
+  const { main } = require('./agf'), stdout = [], stderr = []
+  const code = await main(['looper', 'run', root], {
+    stdout: { write: s => stdout.push(s) }, stderr: { write: s => stderr.push(s) },
+    run: (directory, options) => L.run(directory, { ...options, checks, agent: async args => {
+      const news = args.prompt.includes('Group G3,')
+      if (!news) {
+        const file = args.prompt.includes('Group G1,') ? 'joke.md' : 'poem.md'
+        fs.writeFileSync(path.join(args.cwd, file), 'draft awaiting review\n')
       }
-    })
+      return { ...result(args.attempt, 'blocked'), summary: news
+        ? 'Reliable source pages could not be retrieved.'
+        : 'Required review startup: Operation not permitted.' }
+    } })
+  })
+  assert.equal(code, 2)
+  const saved = read(root)
+  assert.equal(saved.groups[3].workspace, undefined)
+  for (const [i, file] of [[0, 'joke.md'], [1, 'poem.md']]) {
+    assert.ok(fs.existsSync(path.join(saved.groups[i].workspace.worktree, file)))
+    assert.equal(fs.existsSync(path.join(repo, file)), false)
   }
+  assert.match(stdout.join(''), /Tasks completed: 0\/6; Groups integrated: 0\/4/)
+  assert.match(stdout.join(''), /G4: WAITING \(pending\)\n    Waiting for checked dependencies: G1, G2, G3/)
+  assert.match(stdout.join(''), /Required review startup: Operation not permitted/)
+  assert.match(stdout.join(''), /Reliable source pages could not be retrieved/)
+  assert.match(stdout.join(''), /Saved report:/)
+  assert.equal(fs.existsSync(path.join(root, '.queue.owner')), false)
 })
 
-test('selected plan same-content replacement and symlink substitution stop safely', async (t) => {
-  for (const mutation of ['same-content', 'symlink']) {
-    await t.test(mutation, async () => {
-      const dir = make_temp_dir(`agentflow-looper-object-${mutation}`)
-      try {
-        const queue = make_queue()
-        const fake_child = make_fake_child(dir)
-        const launch_log = path.join(dir, 'launch.jsonl')
-        write_plan(queue, 'plan-001.md', 'unchanged bytes')
-        write_plan(queue, 'plan-002.md', 'later')
-        const result = await run_looper(base_options(queue, fake_child, {
-          mode: 'mutate',
-          mutation,
-          launch_log,
-        }))
-        assert.notEqual(result.code, 0)
-        assert.match(result.message, /identity|regular|symlink|selected plan/i)
-        assert.equal(fs.existsSync(path.join(queue, 'done', 'plan-001.md')), false)
-        assert.deepEqual(read_json_lines(launch_log).map((entry) => entry.task), ['plan-001.md'])
-        assert.equal(fs.existsSync(path.join(queue, 'plan-002.md')), true)
-        assert.ok(fs.existsSync(stop_path(queue)))
-        const record = read_json(attempt_path(queue))
-        assert.equal(record.phase, 'failed')
-        assert.equal(typeof record.sha256, 'string')
-        assert.equal(typeof record.dev, 'number')
-        assert.equal(typeof record.ino, 'number')
-        assert.equal(typeof record.size, 'number')
-        assert.ok(fs.existsSync(path.join(queue, 'plan-001.md.old')))
-        if (mutation === 'symlink') assert.equal(fs.lstatSync(path.join(queue, 'plan-001.md')).isSymbolicLink(), true)
-        else assert.equal(fs.lstatSync(path.join(queue, 'plan-001.md')).isFile(), true)
-      } finally {
-        remove_temp_dir(dir)
+for (const moment of ['checks', 'landing']) test(`forward target at ${moment} carries checked repaired result without task replay`, { timeout: 30000 }, async () => {
+  const { root, repo } = fixture([['a.txt']], { repair: selection, acceptance: selection })
+  let tasks = 0, repairs = 0, combined = 0, moved = false
+  const advance = () => {
+    if (moved) return
+    moved = true
+    fs.writeFileSync(path.join(repo, 'outside.txt'), 'owner forward\n')
+    git(repo, 'add', 'outside.txt'); git(repo, 'commit', '-m', 'owner forward')
+  }
+  assert.equal(await L.run(root, { agent: async args => {
+    if (args.role === 'task') { tasks++; return agent(args) }
+    if (args.role === 'repair') { repairs++; fs.writeFileSync(path.join(args.cwd, 'a.txt'), 'accepted repair\n') }
+    return result(args.attempt)
+  }, checks: async args => {
+    if (path.basename(args.cwd).startsWith('aglite-merge-')) {
+      combined++
+      if (combined === 1) return args.ids.map(id => ({ id, passed: false }))
+      if (moment === 'checks' && combined === 2) advance()
+    }
+    return checks(args)
+  }, on_save: q => { if (moment === 'landing' && q.integration?.phase === 'landing') advance() } }), 0)
+  const q = read(root), previous = q.groups[0].integration_history[0]
+  assert.equal(tasks, 1); assert.equal(repairs, 1)
+  assert.ok(combined >= 3)
+  assert.equal(q.groups[0].integration.source, previous.result)
+  assert.equal(fs.readFileSync(path.join(previous.worktree, 'a.txt'), 'utf8'), 'accepted repair\n')
+  assert.equal(fs.readFileSync(path.join(repo, 'a.txt'), 'utf8'), 'accepted repair\n')
+})
+
+test('landing recovery recognizes result ancestor and refuses landed then removed history', { timeout: 30000 }, async () => {
+  const { root, repo } = fixture([['a.txt']])
+  let image
+  assert.equal(await L.run(root, { agent, checks, on_save: q => {
+    if (q.integration?.phase !== 'landing' || image) return
+    image = structuredClone(q)
+    git(repo, 'merge', '--ff-only', q.integration.result)
+    throw Error('crash after effect')
+  } }), 2)
+  fs.writeFileSync(path.join(repo, 'later.txt'), 'later\n')
+  git(repo, 'add', 'later.txt'); git(repo, 'commit', '-m', 'later')
+  write(root, image)
+  assert.equal(await L.run(root, { checks, agent: async () => { throw Error('replay') } }), 0)
+  git(repo, 'reset', '--hard', image.integration.base)
+  fs.writeFileSync(path.join(repo, 'removed.txt'), 'owner\n')
+  git(repo, 'add', 'removed.txt'); git(repo, 'commit', '-m', 'removed landed history')
+  write(root, image)
+  await assert.rejects(L.run(root, { agent, checks }), /uncertain|removed/)
+})
+
+test('changed contracts receive original/current context and independent review acceptance', { timeout: 30000 }, async () => {
+  const { root, repo, q } = fixture([['a.txt']], { acceptance: selection })
+  fs.writeFileSync(path.join(repo, 'AGENTS.md'), 'Original requirement.\n')
+  git(repo, 'add', 'AGENTS.md'); git(repo, 'commit', '-m', 'original contract')
+  q.base_commit = git(repo, 'rev-parse', 'HEAD'); write(root, q)
+  fs.writeFileSync(path.join(repo, 'AGENTS.md'), 'Compatible current requirement.\n')
+  git(repo, 'add', 'AGENTS.md'); git(repo, 'commit', '-m', 'current contract')
+  const roles = []
+  let advanced = false
+  assert.equal(await L.run(root, { checks, agent: async args => {
+    roles.push(args.role)
+    assert.match(args.prompt, /Original requirement/)
+    assert.match(args.prompt, /Compatible current requirement/)
+    return args.role === 'task' ? agent(args) : result(args.attempt)
+  }, on_save: saved => {
+    if (advanced || saved.integration?.phase !== 'verified' || !saved.integration.acceptance_result) return
+    advanced = true
+    fs.writeFileSync(path.join(repo, 'later.txt'), 'unrelated owner advance\n')
+    git(repo, 'add', 'later.txt'); git(repo, 'commit', '-m', 'unrelated owner advance')
+  } }), 0)
+  assert.deepEqual(roles, ['task', 'review', 'acceptance'])
+  const integrated = read(root).groups[0].integration
+  assert.match(integrated.accepted_contracts_sha256, /^[a-f0-9]{64}$/)
+  assert.equal(integrated.accepted_contracts, undefined)
+  assert.ok(integrated.supersedes)
+})
+
+test('adoption refuses branch mismatch, rewrite and foreign operations; status stays read-only', () => {
+  const G = require('./looper-integration')
+  const { root, repo, q } = fixture([['a.txt']])
+  q.expected_head = q.base_commit
+  git(repo, 'checkout', '-b', 'other')
+  assert.throws(() => G.adopt_target(q, () => {}, 'test'), /branch mismatch/)
+  git(repo, 'checkout', 'main')
+  fs.writeFileSync(path.join(repo, 'next.txt'), 'next\n')
+  git(repo, 'add', 'next.txt'); git(repo, 'commit', '-m', 'next')
+  q.expected_head = git(repo, 'rev-parse', 'HEAD')
+  git(repo, 'reset', '--hard', q.base_commit)
+  assert.throws(() => G.adopt_target(q, () => {}, 'test'), /history rewrite/)
+  q.expected_head = q.base_commit
+  const lock = path.join(repo, '.git', 'index.lock')
+  fs.writeFileSync(lock, 'foreign')
+  assert.throws(() => G.adopt_target(q, () => {}, 'test'), /Foreign Git operation/)
+  fs.renameSync(lock, `${lock}.retained`)
+  q.lane_error = 'one specific lane blocker'; write(root, q)
+  const before = fs.readFileSync(path.join(root, 'queue.json'))
+  const output = L.status(root)
+  assert.match(output, /Target: expected main@/)
+  assert.match(output, /Target actual:.*main/)
+  assert.equal(output.split('one specific lane blocker').length - 1, 1)
+  assert.deepEqual(fs.readFileSync(path.join(root, 'queue.json')), before)
+})
+
+test('adopted conflicting owner commit uses bounded repair review acceptance', { timeout: 30000 }, async () => {
+  const { root, repo } = fixture([['shared.txt']], { repair: selection, acceptance: selection })
+  const roles = []
+  assert.equal(await L.run(root, { checks, agent: async args => {
+    roles.push(args.role)
+    if (args.role === 'task') {
+      fs.writeFileSync(path.join(repo, 'shared.txt'), 'owner change\n')
+      git(repo, 'add', 'shared.txt'); git(repo, 'commit', '-m', 'owner conflict')
+      return agent(args)
+    }
+    if (args.role === 'repair') fs.writeFileSync(path.join(args.cwd, 'shared.txt'), 'owner change and task outcome\n')
+    return result(args.attempt)
+  } }), 0)
+  assert.deepEqual(roles, ['task', 'repair', 'review', 'acceptance'])
+  assert.equal(read(root).groups[0].repairs, 1)
+})
+
+test('unapplied landing intent carries forward with covering reflog; missing coverage blocks', { timeout: 30000 }, async () => {
+  const { root, repo } = fixture([['a.txt']])
+  let image
+  assert.equal(await L.run(root, { agent, checks, on_save: q => {
+    if (q.integration?.phase !== 'landing' || image) return
+    image = structuredClone(q)
+    throw Error('crash before effect')
+  } }), 2)
+  fs.writeFileSync(path.join(repo, 'later.txt'), 'later\n')
+  git(repo, 'add', 'later.txt'); git(repo, 'commit', '-m', 'owner later')
+  const unknown = structuredClone(image)
+  delete unknown.integration.landing_reflog
+  write(root, unknown)
+  await assert.rejects(L.run(root, { agent, checks }), /coverage missing/)
+  write(root, image)
+  assert.equal(await L.run(root, { checks, agent: async () => { throw Error('task replay') } }), 0)
+  assert.equal(read(root).groups[0].integration.source, image.integration.result)
+})
+
+test('dirty contract changes at landing intent require fresh exact acceptance', { timeout: 30000 }, async () => {
+  const { root, repo, q } = fixture([['a.txt']], { acceptance: selection })
+  fs.writeFileSync(path.join(repo, 'contract.md'), 'original\n')
+  git(repo, 'add', 'contract.md'); git(repo, 'commit', '-m', 'original contract')
+  q.base_commit = git(repo, 'rev-parse', 'HEAD'); q.contracts = ['contract.md']; write(root, q)
+  let changed = false
+  const accepted = []
+  assert.equal(await L.run(root, { checks, agent: async args => {
+    if (args.role === 'acceptance') { accepted.push(args.prompt); assert.match(args.prompt, /owner dirty update/) }
+    return args.role === 'task' ? agent(args) : result(args.attempt)
+  }, on_save: saved => {
+    if (changed || saved.integration?.phase !== 'landing') return
+    changed = true
+    fs.writeFileSync(path.join(repo, 'contract.md'), 'owner dirty update\n')
+  } }), 0)
+  assert.equal(accepted.length, 1)
+  assert.equal(fs.readFileSync(path.join(repo, 'contract.md'), 'utf8'), 'owner dirty update\n')
+})
+
+test('repeated compatible advances while adoption is saved settle without a lane blocker', { timeout: 30000 }, async () => {
+  const { root, repo } = fixture([['a.txt']])
+  let remaining = 2, tasks = 0
+  const advance = () => {
+    const file = `outside-${remaining}.txt`
+    fs.writeFileSync(path.join(repo, file), 'owner forward\n')
+    git(repo, 'add', file); git(repo, 'commit', '-m', file)
+  }
+  advance()
+  assert.equal(await L.run(root, { checks, agent: async args => { tasks++; return agent(args) }, on_save: q => {
+    if (remaining && q.target_adoptions?.length) { remaining--; advance() }
+  } }), 0)
+  assert.equal(tasks, 1)
+  assert.equal(read(root).target_adoptions.length, 3)
+  assert.equal(read(root).lane_error, null)
+})
+
+test('carry preparation target race retries before intent and archives previous attempt once', { timeout: 30000 }, async () => {
+  const G = require('./looper-integration')
+  const original = G.prepare_integration
+  const { root, repo } = fixture([['a.txt']])
+  let tasks = 0, advanced = false, raced = false
+  const advance = file => {
+    fs.writeFileSync(path.join(repo, file), 'owner forward\n')
+    git(repo, 'add', file); git(repo, 'commit', '-m', file)
+  }
+  G.prepare_integration = (queue, group, save, previous) => {
+    if (previous && !raced) { raced = true; advance('carry-race.txt') }
+    return original(queue, group, save, previous)
+  }
+  try {
+    assert.equal(await L.run(root, { agent: async args => { tasks++; return agent(args) }, checks: async args => {
+      if (!advanced && path.basename(args.cwd).startsWith('aglite-merge-')) {
+        advanced = true; advance('checked-race.txt')
       }
-    })
-  }
+      return checks(args)
+    } }), 0)
+  } finally { G.prepare_integration = original }
+  const group = read(root).groups[0]
+  assert.equal(tasks, 1)
+  assert.equal(raced, true)
+  assert.equal(group.integration_history.length, 1)
+  assert.equal(group.integration.supersedes, group.integration_history[0].id)
+  assert.equal(group.integration.source, group.integration_history[0].result)
 })
 
-test('destination collision preserves both files and starts no later plan', async () => {
-  const dir = make_temp_dir('agentflow-looper-collision')
+test('repair owner question survives compatible advance in integration error handler', { timeout: 30000 }, async () => {
+  const { root, repo } = fixture([['a.txt'], ['b.txt']], { repair: selection, acceptance: selection })
+  assert.equal(await L.run(root, { checks: async args => args.ids.map(id => ({ id, passed: !path.basename(args.cwd).includes('merge-fixture-G1') })), agent: async args => {
+    if (args.role === 'task') return agent(args)
+    fs.writeFileSync(path.join(repo, 'outside.txt'), 'owner\n')
+    git(repo, 'add', 'outside.txt'); git(repo, 'commit', '-m', 'repair-time owner advance')
+    return { ...result(args.attempt, 'needs_owner'), summary: 'Choose required behavior.' }
+  } }), 2)
+  const q = read(root)
+  assert.equal(q.lane_error, null)
+  assert.equal(q.questions[0].requires_owner, true)
+  assert.match(q.questions[0].question, /Choose required behavior/)
+  assert.equal(q.groups[1].state, 'done')
+})
+
+test('post-landing lock preserves saved checked completion and is lane-only', { timeout: 30000 }, async () => {
+  const { root, repo } = fixture([['a.txt']])
+  const lock = path.join(repo, '.git/index.lock')
+  let locked = false
   try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    const launch_log = path.join(dir, 'launch.jsonl')
-    write_plan(queue, 'plan-001.md', 'source')
-    write_plan(queue, 'plan-002.md', 'later')
-    fs.writeFileSync(path.join(queue, 'done', 'plan-001.md'), 'destination\n')
-    const result = await run_looper(base_options(queue, fake_child, { launch_log }))
-    assert.notEqual(result.code, 0)
-    assert.match(result.message, /collision|destination/i)
-    assert.equal(fs.readFileSync(path.join(queue, 'plan-001.md'), 'utf8'), 'source\n')
-    assert.equal(fs.readFileSync(path.join(queue, 'done', 'plan-001.md'), 'utf8'), 'destination\n')
-    assert.deepEqual(read_json_lines(launch_log).map((entry) => entry.task), ['plan-001.md'])
-    assert.equal(fs.existsSync(path.join(queue, 'plan-002.md')), true)
-  } finally {
-    remove_temp_dir(dir)
+    assert.equal(await L.run(root, { agent, checks, on_save: q => {
+      if (!locked && q.groups[0].state === 'done') { locked = true; fs.writeFileSync(lock, 'owner lock') }
+    } }), 0)
+    const q = read(root)
+    assert.equal(q.groups[0].state, 'done')
+    assert.match(q.lane_error, /Foreign Git operation/)
+    assert.equal(q.questions.length, 0)
+  } finally { if (fs.existsSync(lock)) fs.renameSync(lock, `${lock}.retained`) }
+})
+
+test('prepared carried merge recovery retains checked repair and never repeats task', { timeout: 30000 }, async () => {
+  const G = require('./looper-integration'), original = G.prepare_integration
+  const { root, repo } = fixture([['a.txt']], { repair: selection, acceptance: selection })
+  let tasks = 0, combined = 0, crashed = false
+  const worker = async args => {
+    if (args.role === 'task') { tasks++; return agent(args) }
+    if (args.role === 'repair') fs.writeFileSync(path.join(args.cwd, 'a.txt'), 'accepted repair\n')
+    return result(args.attempt)
   }
-})
-
-test('injected move failure preserves the source and primary reason', async () => {
-  const dir = make_temp_dir('agentflow-looper-move-failure')
+  G.prepare_integration = (q, g, save, previous) => original(q, g, () => {
+    save()
+    if (previous && !crashed && q.integration.phase === 'prepared') { crashed = true; throw Error('prepared carry crash') }
+  }, previous)
   try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    write_plan(queue, 'plan-001.md')
-    write_plan(queue, 'plan-002.md')
-    const result = await run_looper(base_options(queue, fake_child, {}, {
-      move_plan: () => {
-        throw new Error('injected move denied')
-      },
-    }))
-    assert.notEqual(result.code, 0)
-    assert.match(result.message, /injected move denied/)
-    assert.equal(fs.existsSync(path.join(queue, 'plan-001.md')), true)
-    assert.equal(fs.existsSync(path.join(queue, 'done', 'plan-001.md')), false)
-    assert.equal(fs.existsSync(path.join(queue, 'plan-002.md')), true)
-  } finally {
-    remove_temp_dir(dir)
-  }
-})
-
-test('primary failures remain visible when secondary evidence writing fails', async (t) => {
-  await t.test('stop marker failure', async () => {
-    const dir = make_temp_dir('agentflow-looper-secondary-stop')
-    try {
-      const queue = make_queue()
-      const fake_child = make_fake_child(dir)
-      write_plan(queue, 'plan-001.md')
-      const result = await run_looper(base_options(queue, fake_child, { mode: 'no-marker' }, {
-        write_stop_marker: () => {
-          throw new Error('stop evidence denied')
-        },
-      }))
-      assert.notEqual(result.code, 0)
-      assert.match(result.message, /exactly one|completion/i)
-      assert.match(result.message, /stop evidence denied/)
-      assert.doesNotMatch(result.message, /TypeError|undefined is not/i)
-    } finally {
-      remove_temp_dir(dir)
-    }
-  })
-
-  await t.test('attempt record failure', async () => {
-    const dir = make_temp_dir('agentflow-looper-secondary-attempt')
-    try {
-      const queue = make_queue()
-      const fake_child = make_fake_child(dir)
-      write_plan(queue, 'plan-001.md')
-      const result = await run_looper(base_options(queue, fake_child, {}, {
-        write_attempt_record: () => {
-          throw new Error('attempt evidence denied')
-        },
-      }))
-      assert.notEqual(result.code, 0)
-      assert.match(result.message, /attempt evidence denied/)
-      assert.doesNotMatch(result.message, /TypeError|undefined is not/i)
-      assert.equal(fs.existsSync(path.join(queue, 'plan-001.md')), true)
-    } finally {
-      remove_temp_dir(dir)
-    }
-  })
-})
-
-test('missing directories, non-directories, and unavailable executables fail concisely', async (t) => {
-  await t.test('missing directory', async () => {
-    const dir = make_temp_dir('agentflow-looper-missing')
-    try {
-      const result = await run_looper({ tasks_dir: path.join(dir, 'missing'), state_root: test_state_root, silent: true })
-      assert.notEqual(result.code, 0)
-      assert.match(result.message, /missing|directory|ENOENT/i)
-      assert.doesNotMatch(result.message, /uncaught|TypeError/i)
-    } finally {
-      remove_temp_dir(dir)
-    }
-  })
-
-  await t.test('not a directory', async () => {
-    const dir = make_temp_dir('agentflow-looper-not-dir')
-    try {
-      const file = path.join(dir, 'tasks')
-      fs.writeFileSync(file, 'not a directory\n')
-      const result = await run_looper({ tasks_dir: file, state_root: test_state_root, silent: true })
-      assert.notEqual(result.code, 0)
-      assert.match(result.message, /directory|ENOTDIR/i)
-    } finally {
-      remove_temp_dir(dir)
-    }
-  })
-
-	await t.test('unavailable executable', async () => {
-		const dir = make_temp_dir('agentflow-looper-no-exec')
-		try {
-			const queue = path.join(dir, 'planned')
-			fs.mkdirSync(path.join(queue, 'done'), { recursive: true })
-			fs.writeFileSync(path.join(dir, 'ag.json'), JSON.stringify(agentflow_settings.make_template('codex')))
-			write_plan(queue, 'plan-001.md')
-			const result = await run_looper({
-				tasks_dir: queue,
-				root: dir,
-        state_root: test_state_root,
-        completion_path,
-        executable: path.join(dir, 'missing-executable'),
-        silent: true,
-      })
-      assert.notEqual(result.code, 0)
-      assert.equal(result.handoff, true)
-      assert.match(result.message, /interactive host/i)
-      assert.equal(fs.existsSync(stop_path(queue)), false)
-		} finally {
-			remove_temp_dir(dir)
-		}
-  })
-
-  await t.test('inaccessible directory', async () => {
-    const dir = make_temp_dir('agentflow-looper-inaccessible')
-    try {
-      const queue = make_queue()
-      const denied_fs = new Proxy(fs, {
-        get(target, property) {
-          if (property === 'readdirSync') return () => {
-            const error = new Error('permission denied')
-            error.code = 'EACCES'
-            throw error
-          }
-          const value = target[property]
-          return typeof value === 'function' ? value.bind(target) : value
-        },
-      })
-      const result = await run_looper({ tasks_dir: queue, state_root: test_state_root, fs: denied_fs, silent: true })
-      assert.notEqual(result.code, 0)
-      assert.match(result.message, /permission denied|EACCES/i)
-      assert.doesNotMatch(result.message, /uncaught|TypeError/i)
-    } finally {
-      remove_temp_dir(dir)
-    }
-  })
-
-	await t.test('ownership evidence permission failure', async () => {
-		const dir = make_temp_dir('agentflow-looper-owner-permission')
-		try {
-			const queue = path.join(dir, 'planned')
-			fs.mkdirSync(path.join(queue, 'done'), { recursive: true })
-			fs.writeFileSync(path.join(dir, 'ag.json'), JSON.stringify(agentflow_settings.make_template('codex')))
-      const denied_fs = new Proxy(fs, {
-        get(target, property) {
-          if (property === 'writeFileSync') return (file, ...args) => {
-            if (String(file).includes('.looper.lock')) {
-              const error = new Error('owner permission denied')
-              error.code = 'EACCES'
-              throw error
-            }
-            return target.writeFileSync.call(target, file, ...args)
-          }
-          const value = target[property]
-          return typeof value === 'function' ? value.bind(target) : value
-        },
-      })
-		write_plan(queue, 'plan-001.md')
-		const result = await run_looper({ tasks_dir: queue, root: dir, state_root: test_state_root, fs: denied_fs, silent: true, executable_available: () => true })
-      assert.notEqual(result.code, 0)
-      assert.match(result.message, /owner permission denied|ownership evidence/i)
-      assert.equal(fs.existsSync(path.join(queue, 'plan-001.md')), true)
-    } finally {
-      remove_temp_dir(dir)
-    }
-  })
-})
-
-test('hostile data stays literal and does not create commands or files', async () => {
-  const dir = make_temp_dir('agentflow-looper-hostile')
-  const hostile_dir = path.join(dir, 'queue ; $(touch injected)')
-  try {
-    fs.mkdirSync(hostile_dir)
-    fs.mkdirSync(path.join(hostile_dir, 'done'))
-    const fake_child = make_fake_child(dir)
-    const launch_log = path.join(dir, 'launch.jsonl')
-    const hostile_prompt = 'prompt; $(touch prompt-created) && "quoted" > redirected'
-    const hostile_marker = 'notebook;$(touch marker-created) updated'
-    write_plan(hostile_dir, 'plan-001.md', 'name;$(touch content-created)\n"quoted" > redirected')
-    const result = await run_looper({
-      ...base_options(hostile_dir, fake_child, { launch_log }),
-      completion_line: hostile_marker,
-      prompt_builder: () => hostile_prompt,
-      build_args: ({ task, plan_path, prompt }) => [fake_child, JSON.stringify({
-        mode: 'success',
-        marker: hostile_marker,
-        launch_log,
-        task,
-        plan_path,
-        prompt,
-        tasks_dir: hostile_dir,
-      })],
-    })
-    assert.equal(result.code, 0)
-    const launch = read_json_lines(launch_log)[0]
-    assert.equal(launch.prompt, hostile_prompt)
-    assert.equal(fs.existsSync(path.join(dir, 'injected')), false)
-    assert.equal(fs.existsSync(path.join(dir, 'prompt-created')), false)
-    assert.equal(fs.existsSync(path.join(dir, 'marker-created')), false)
-    assert.equal(fs.existsSync(path.join(dir, 'content-created')), false)
-    assert.ok(fs.existsSync(path.join(hostile_dir, 'done', 'plan-001.md')))
-  } finally {
-    remove_temp_dir(dir)
-  }
-})
-
-test('the default child boundary is injected, ephemeral, shell-free, and fresh per plan', async () => {
-  const dir = make_temp_dir('agentflow-looper-default-spawn')
-  try {
-    const queue = make_queue()
-    write_plan(queue, 'plan-001.md')
-    write_plan(queue, 'plan-002.md')
-    const calls = []
-    const children = []
-    let next_pid = 7001
-    const injected_spawn = (executable, args, options) => {
-      const child = new EventEmitter()
-      child.stdout = new PassThrough()
-      child.stderr = new PassThrough()
-      child.pid = next_pid++
-      child.kill = () => true
-      calls.push({ executable, args, options })
-      children.push(child)
-      fs.ftruncateSync(options.stdio[3], 0)
-      fs.writeSync(options.stdio[3], `${completion_line}\n`, 0, 'utf8')
-      setImmediate(() => {
-        child.stdout.end('fake child diagnostic\n')
-        child.stderr.end('fake child report\n')
-        child.emit('close', 0, null)
-      })
-      return child
-    }
-
-    const result = await run_looper({
-      root: dir,
-      tasks_dir: queue,
-      state_root: test_state_root,
-      completion_path,
-      executable: 'codex',
-      worker_config: { switches: { 'allowed-worker': ['external'], 'cli-provider': 'on' }, 'external-workers': [{ id: 'codex', command: ['codex', 'exec'], family: 'codex', priority: 1, tiers: { basic: 'fixture/low' } }] },
-      executable_available: () => true,
-      spawn: injected_spawn,
-      silent: true,
-      verify_notebook_round: false,
-    })
-
-    assert.equal(result.code, 0)
-    assert.deepEqual(result.launched, ['plan-001.md', 'plan-002.md'])
-    assert.equal(calls.length, 2)
-    assert.notEqual(children[0], children[1])
-    for (const [index, call] of calls.entries()) {
-      const task = `plan-${String(index + 1).padStart(3, '0')}.md`
-      const prompt = `Execute the frozen plan directly: ${path.relative(dir, path.join(queue, task))}\n\nYou are the plan worker already launched by agf-looper. Execute the named plan directly and complete the product work yourself. Do not invoke agf-looper or start another plan worker. Do not invoke Agentflow, codex, claude, another model CLI, a subagent, a delegate, or an independent review process. Complete the Agentflow notebook record for this plan. A completed round must contain its exact \`# ← Reply / A-NNN\` heading and must end with the next sequential scaffold in exactly this form, including the bare plus line: \`# → Ask / A-NNN\n\n+\`. Do not treat a summary, final report, commit, or bare completion signal as a completed notebook round without the Reply heading and that full next-Ask scaffold. When the plan and its record are safely complete, your entire final response must be exactly: ${completion_line}`
-      assert.equal(call.executable, 'codex')
-      assert_final_message_argument(call.args[9])
-      assert.deepEqual(call.args, ['exec', '--sandbox', 'workspace-write', '--ephemeral', '-m', 'fixture', '-c', 'model_reasoning_effort=low', '--output-last-message', call.args[9], prompt])
-      assert.equal(call.options.shell, false)
-      assert.equal(call.options.cwd, fs.realpathSync(dir))
-    }
-    assert.ok(fs.existsSync(path.join(queue, 'done', 'plan-001.md')))
-    assert.ok(fs.existsSync(path.join(queue, 'done', 'plan-002.md')))
-  } finally {
-    remove_temp_dir(dir)
-  }
-})
-
-test('plan hashing uses bounded descriptor reads and accepts exactly 1 MiB', async () => {
-  const dir = make_temp_dir('agentflow-looper-plan-ceiling')
-  try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    const plan = path.join(queue, 'plan-001.md')
-    fs.writeFileSync(plan, Buffer.alloc(1024 * 1024, 0x61))
-    let plan_read_file_calls = 0
-    let plan_read_calls = 0
-    const tracked_fs = new Proxy(fs, {
-      get(target, property) {
-        if (property === 'readFileSync') return (file, ...args) => {
-          if (path.resolve(String(file)) === path.resolve(plan)) plan_read_file_calls += 1
-          return target.readFileSync.call(target, file, ...args)
+    assert.equal(await L.run(root, { agent: worker, checks: async args => {
+      if (path.basename(args.cwd).startsWith('aglite-merge-')) {
+        combined++
+        if (combined === 1) return args.ids.map(id => ({ id, passed: false }))
+        if (combined === 2) {
+          fs.writeFileSync(path.join(repo, 'outside.txt'), 'owner\n')
+          git(repo, 'add', 'outside.txt'); git(repo, 'commit', '-m', 'advance repaired result')
         }
-        if (property === 'readSync') return (fd, ...args) => {
-          plan_read_calls += 1
-          return target.readSync.call(target, fd, ...args)
-        }
-        const value = target[property]
-        return typeof value === 'function' ? value.bind(target) : value
-      },
-    })
-    const result = await run_looper(base_options(queue, fake_child, {}, { fs: tracked_fs }))
-    assert.equal(result.code, 0)
-    assert.equal(plan_read_file_calls, 0)
-    assert.ok(plan_read_calls > 0)
-    const record = read_json(attempt_path(queue))
-    assert.equal(record.size, 1024 * 1024)
-    assert.equal(typeof record.sha256, 'string')
-    assert.equal(typeof record.dev, 'number')
-    assert.equal(typeof record.ino, 'number')
-  } finally {
-    remove_temp_dir(dir)
-  }
-})
-
-test('a plan one byte over 1 MiB stops before spawn or whole-file read', async () => {
-  const dir = make_temp_dir('agentflow-looper-plan-over-ceiling')
-  try {
-    const queue = make_queue()
-    const fake_child = make_fake_child(dir)
-    const plan = path.join(queue, 'plan-001.md')
-    fs.writeFileSync(plan, Buffer.alloc(1024 * 1024 + 1, 0x62))
-    let plan_read_file_calls = 0
-    let plan_read_calls = 0
-    let spawn_calls = 0
-    const tracked_fs = new Proxy(fs, {
-      get(target, property) {
-        if (property === 'readFileSync') return (file, ...args) => {
-          if (path.resolve(String(file)) === path.resolve(plan)) plan_read_file_calls += 1
-          return target.readFileSync.call(target, file, ...args)
-        }
-        if (property === 'readSync') return (fd, ...args) => {
-          plan_read_calls += 1
-          return target.readSync.call(target, fd, ...args)
-        }
-        const value = target[property]
-        return typeof value === 'function' ? value.bind(target) : value
-      },
-    })
-    const result = await run_looper(base_options(queue, fake_child, {}, {
-      fs: tracked_fs,
-      spawn: () => {
-        spawn_calls += 1
-        throw new Error('spawn must not be reached')
-      },
-    }))
-    assert.notEqual(result.code, 0)
-    assert.match(result.message, /1,048,576|1048576|size|large/i)
-    assert.equal(spawn_calls, 0)
-    assert.equal(plan_read_file_calls, 0)
-    assert.equal(plan_read_calls, 0)
-    assert.equal(fs.existsSync(path.join(queue, 'done', 'plan-001.md')), false)
-    assert.equal(read_json(attempt_path(queue)).phase, 'failed')
-  } finally {
-    remove_temp_dir(dir)
-  }
-})
-
-const spawn_runner_process = ({ queue, fake_child, config, result_file, signal_file, completion = completion_path }) => {
-  const script = `const { run_looper } = require(${JSON.stringify(module_path)})
-const fs = require('node:fs')
-const path = require('node:path')
-const queue = ${JSON.stringify(queue)}
-const fake_child = ${JSON.stringify(fake_child)}
-const config = ${JSON.stringify(config)}
-const result_file = ${JSON.stringify(result_file)}
-const state_root = ${JSON.stringify(test_state_root)}
-const runner_event_file = ${JSON.stringify(config.runner_event_file || '')}
-const run = run_looper({
-  tasks_dir: queue,
-  root: path.dirname(fake_child),
-  state_root,
-  completion_path: ${JSON.stringify(completion)},
-  executable: process.execPath,
-  build_args: ({ task, plan_path, prompt }) => [fake_child, JSON.stringify({ ...config, marker: ${JSON.stringify(`${completion} updated`)}, task, plan_path, prompt, tasks_dir: queue })],
-  on_event: (event) => { if (runner_event_file) fs.appendFileSync(runner_event_file, JSON.stringify({ ...event, at: Date.now() }) + '\\n') },
-  silent: true,
-})
-run.then((result) => { fs.writeFileSync(result_file, JSON.stringify(result)); process.exitCode = result.code })
-`
-  return spawn(process.execPath, ['-e', script], { stdio: ['ignore', 'pipe', 'pipe'] })
-}
-
-const wait_for_file = async (file, timeout = 5000) => {
-  const started = Date.now()
-  while (!fs.existsSync(file)) {
-    if (Date.now() - started > timeout) throw new Error(`timed out waiting for ${file}`)
-    await new Promise((resolve) => setTimeout(resolve, 10))
-  }
-}
-
-test('SIGINT and SIGTERM record interruption before forwarding and stop the detached fake group', { skip: process.platform === 'win32' ? 'Windows cannot deliver SIGINT or SIGTERM to another process' : false }, async (t) => {
-  for (const signal of ['SIGINT', 'SIGTERM']) {
-    await t.test(signal, async () => {
-      const dir = make_temp_dir(`agentflow-looper-${signal}`)
-      let runner
-      try {
-        const queue = make_queue()
-        const fake_child = make_fake_child(dir)
-        const launch_log = path.join(dir, 'launch.jsonl')
-        const signal_log = path.join(dir, 'signals.jsonl')
-        const event_file = path.join(dir, 'events.jsonl')
-        const runner_event_file = path.join(dir, 'runner-events.jsonl')
-        const heartbeat_file = path.join(dir, 'heartbeat.log')
-        const result_file = path.join(dir, 'result.json')
-        fs.writeFileSync(path.join(dir, 'devlog.md'), '# → Ask / A-001\n\n+ \n')
-        write_plan(queue, 'plan-001.md')
-        write_plan(queue, 'plan-002.md')
-        runner = spawn_runner_process({
-          queue,
-          fake_child,
-          result_file,
-          config: {
-            mode: 'signal-tree',
-            launch_log,
-            signal_file: signal_log,
-            event_file,
-            runner_event_file,
-            heartbeat_file,
-            ignore_first: true,
-          },
-        })
-        await wait_for_file(launch_log)
-        await wait_for_file(heartbeat_file + '.ready')
-        const before_signal = Date.now()
-        runner.kill(signal)
-        runner.kill(signal)
-        await new Promise((resolve, reject) => {
-          runner.once('exit', resolve)
-          runner.once('error', reject)
-        })
-        await wait_for_file(result_file)
-        const result = read_json(result_file)
-        assert.equal(result.code, signal === 'SIGINT' ? 130 : 143)
-        assert.ok(fs.existsSync(stop_path(queue)))
-        const attempt = read_json(attempt_path(queue))
-        assert.equal(attempt.phase, 'interrupted')
-        assert.equal(fs.existsSync(path.join(queue, 'plan-001.md')), true)
-        assert.equal(fs.existsSync(path.join(queue, 'done', 'plan-001.md')), false)
-        assert.equal(fs.existsSync(path.join(queue, 'plan-002.md')), true)
-        const signals = read_json_lines(signal_log)
-        assert.ok(signals.some((entry) => entry.who === 'parent' && entry.signal === signal))
-        assert.ok(signals.some((entry) => entry.who === 'grandchild' && entry.signal === signal))
-        const runner_events = read_json_lines(runner_event_file)
-        const interrupted_at = runner_events.find((entry) => entry.event === 'interruption-recorded').at
-        const forwarded_at = runner_events.find((entry) => entry.event === 'signal-forwarded').at
-        const forced_at = runner_events.find((entry) => entry.event === 'signal-force-forwarded').at
-        assert.ok(interrupted_at <= forwarded_at)
-        assert.ok(forwarded_at - interrupted_at < 500)
-        assert.ok(forced_at - forwarded_at >= 450)
-        assert.ok(Date.now() - before_signal >= 450)
-        assert.equal(fs.readFileSync(heartbeat_file, 'utf8').length > 0, true)
-      } finally {
-        if (runner && runner.exitCode === null) runner.kill('SIGKILL')
-        remove_temp_dir(dir)
       }
+      return checks(args)
+    } }), 2)
+  } finally { G.prepare_integration = original }
+  const stopped = read(root)
+  assert.equal(stopped.groups[0].suspended_integration.phase, 'prepared')
+  answer(root, stopped.questions[0], 'host')
+  assert.equal(await L.run(root, { agent: worker, checks }), 0)
+  assert.equal(tasks, 1)
+  assert.equal(fs.readFileSync(path.join(repo, 'a.txt'), 'utf8'), 'accepted repair\n')
+})
+
+test('landing overlap blocks lane while unrelated existing workspace finishes its next task', { timeout: 30000 }, async () => {
+  const { root, repo } = fixture([['a.txt'], ['b.txt', 'c.txt']])
+  const lane = deferred()
+  let second_started = false
+  fs.writeFileSync(path.join(repo, 'a.txt'), 'owner pending\n')
+  assert.equal(await L.run(root, { checks, agent: async args => {
+    if (args.prompt.includes('task T2-2;')) second_started = true
+    const done = await agent(args)
+    if (args.prompt.includes('task T2-1;')) await lane.promise
+    return done
+  }, on_save: q => { if (q.lane_error) lane.resolve() } }), 2)
+  const q = read(root)
+  assert.equal(second_started, true)
+  assert.ok(q.groups[1].tasks.every(task => task.state === 'done'))
+  assert.equal(fs.readFileSync(path.join(repo, 'a.txt'), 'utf8'), 'owner pending\n')
+})
+
+test('answered integration correction reaches fresh repair review acceptance exactly once', { timeout: 30000 }, async () => {
+  const { root } = fixture([['a.txt']], { repair: selection, acceptance: selection })
+  let resumed = false, requestRepair = true, combined = 0, tasks = 0
+  const observed = []
+  const worker = async args => {
+    if (args.role === 'task') { tasks++; return agent(args) }
+    if (resumed) {
+      observed.push(args.role)
+      assert.equal(args.prompt.split('Resolved answers/corrections (').length - 1, 1)
+      assert.equal(args.prompt.split('Correction supplied; continue.').length - 1, 1)
+      assert.match(args.prompt, /"answer_source":"host"/)
+      assert.match(args.prompt, /host technical corrections grant no new scope/)
+      assert.equal(args.prompt.includes('Owner answers:'), false)
+    }
+    if (args.role === 'review') {
+      if (!resumed) return result(args.attempt, 'blocked')
+      if (requestRepair) { requestRepair = false; return result(args.attempt, 'repair') }
+    }
+    if (args.role === 'repair') fs.writeFileSync(path.join(args.cwd, 'a.txt'), 'restored exact outcome\n')
+    return result(args.attempt)
+  }
+  const combinedChecks = async args => {
+    if (path.basename(args.cwd).startsWith('aglite-merge-') && ++combined === 1)
+      return args.ids.map(id => ({ id, passed: false }))
+    return checks(args)
+  }
+  assert.equal(await L.run(root, { agent: worker, checks: combinedChecks }), 2)
+  answer(root, read(root).questions[0], 'host')
+  resumed = true
+  assert.equal(await L.run(root, { agent: worker, checks: combinedChecks }), 0)
+  assert.deepEqual(observed, ['review', 'repair', 'review', 'acceptance'])
+  assert.equal(tasks, 1)
+})
+
+test('resumed old-base repair checks only ancestral groups then carry checks latest files', { timeout: 30000 }, async () => {
+  const { root, q } = fixture([['a.txt'], ['b.txt']], { repair: selection, acceptance: selection })
+  for (const key of ['a', 'b']) q.checks[key] = { command: [process.execPath, '-e', 'process.exit(0)'] }
+  q.groups[0].tasks[0].checks = ['a']; q.groups[1].tasks[0].checks = ['b']; write(root, q)
+  const release = deferred(), observations = []
+  let resumed = false, requestRepair = true, repairs = 0, firstFailure = true
+  const worker = async args => {
+    if (args.role === 'task') {
+      if (args.prompt.includes('Group G2,')) await release.promise
+      return agent(args)
+    }
+    if (args.role === 'repair') { repairs++; fs.writeFileSync(path.join(args.cwd, 'a.txt'), 'exact restored output\n') }
+    if (args.role === 'review' && args.prompt.includes('T1-1')) {
+      if (!resumed) { release.resolve(); return result(args.attempt, 'blocked') }
+      if (requestRepair) { requestRepair = false; return result(args.attempt, 'repair') }
+    }
+    return result(args.attempt)
+  }
+  const fileChecks = async args => {
+    const combined = path.basename(args.cwd).startsWith('aglite-merge-')
+    const hasB = fs.existsSync(path.join(args.cwd, 'b.txt'))
+    if (combined) observations.push({ resumed, ids: [...args.ids], hasB })
+    return args.ids.map(id => {
+      let passed = id === 'product' || fs.existsSync(path.join(args.cwd, `${id}.txt`))
+      if (combined && args.ids.includes('a') && firstFailure) { firstFailure = false; passed = false }
+      return { id, passed }
     })
   }
+  assert.equal(await L.run(root, { agent: worker, checks: fileChecks }), 2)
+  const stopped = read(root)
+  assert.equal(stopped.groups[1].state, 'done')
+  assert.equal(stopped.groups[0].suspended_integration.phase, 'review')
+  answer(root, stopped.questions[0], 'host'); resumed = true
+  assert.equal(await L.run(root, { agent: worker, checks: fileChecks }), 0)
+  assert.equal(repairs, 2)
+  assert.ok(observations.some(item => item.resumed && item.ids.includes('a') && !item.hasB && !item.ids.includes('b')))
+  assert.ok(observations.some(item => item.resumed && item.ids.includes('a') && item.hasB && item.ids.includes('b')))
+})
+
+for (const corrected of [false, true]) test(`host technical correction rechecks at exhausted repair budget; checker passes=${corrected}`, { timeout: 30000 }, async () => {
+  const { root } = fixture([['a.txt']], { max_repairs: 1, repair: selection, acceptance: selection })
+  let passing = false, repairs = 0, combined = 0
+  const worker = async args => {
+    if (args.role === 'task') return agent(args)
+    if (args.role === 'repair') { repairs++; fs.writeFileSync(path.join(args.cwd, 'a.txt'), 'exact candidate\n') }
+    return result(args.attempt)
+  }
+  const validator = async args => {
+    const isCombined = path.basename(args.cwd).startsWith('aglite-merge-')
+    if (isCombined) combined++
+    return args.ids.map(id => ({ id, passed: !isCombined || passing }))
+  }
+  assert.equal(await L.run(root, { agent: worker, checks: validator }), 2)
+  const stopped = read(root), before = combined
+  assert.equal(stopped.groups[0].repairs, 1)
+  assert.equal(stopped.groups[0].suspended_integration.reason, 'failed combined checks')
+  answer(root, stopped.questions[0], 'host'); passing = corrected
+  assert.equal(await L.run(root, { agent: worker, checks: validator }), corrected ? 0 : 2)
+  assert.ok(combined > before, 'actual combined checks must rerun')
+  assert.equal(repairs, 1, 'technical recheck does not spend or bypass repair budget')
+  assert.equal(read(root).groups[0].state === 'done', corrected)
+})
+
+test('CLI grouped success reads summaries actually persisted by the coordinator', { timeout: 30000 }, async () => {
+  const { root, repo } = fixture([['poem.md']])
+  const { main } = require('./agf'), stdout = []
+  const code = await main(['looper', 'run', root], {
+    stdout: { write: value => stdout.push(value) }, stderr: { write() {} },
+    run: (directory, options) => L.run(directory, { ...options, checks, agent: async args => ({
+      ...await agent(args), summary: 'Created poem.md about the sea.'
+    }) })
+  })
+  assert.equal(code, 0)
+  assert.equal(read(root).groups[0].tasks[0].result.summary, 'Created poem.md about the sea.')
+  assert.match(stdout.join(''), /G1: SUCCESS \(done\)\n    T1-1: SUCCESS — task checked \(done\); integrated target/)
+  assert.match(stdout.join(''), /Created poem.md about the sea\./)
+  assert.ok(stdout.join('').includes(path.join(repo, 'poem.md')))
+  assert.equal(fs.existsSync(path.join(repo, 'poem.md')), true)
+  const report = require('./looper-report')
+  assert.match(fs.readFileSync(path.join(root, 'results.md'), 'utf8'), /Result: COMPLETE/)
+  const disk = fs.readFileSync(path.join(root, 'queue.json'))
+  report.save_report(root, read(root), { code: 0, locale: 'en-us' })
+  assert.deepEqual(fs.readFileSync(path.join(root, 'queue.json')), disk)
+  fs.writeFileSync(path.join(root, '.results-leftover.tmp'), 'retained prepared report')
+  const before_status = fs.readFileSync(path.join(root, 'queue.json'))
+  assert.match(L.status(root), /Latest results:/)
+  assert.deepEqual(fs.readFileSync(path.join(root, 'queue.json')), before_status)
+  const target = git(repo, 'rev-parse', 'HEAD')
+  assert.equal(await L.run(root, { checks, agent: () => assert.fail('completed task dispatched again') }), 0)
+  assert.equal(git(repo, 'rev-parse', 'HEAD'), target)
+  assert.equal(fs.readFileSync(path.join(root, '.results-leftover.tmp'), 'utf8'), 'retained prepared report')
+})
+
+test('Linux descendant listed by ps but exited before identity lookup is absent, not uncertain', { skip: process.platform !== 'linux' }, async t => {
+  const { observe_descendants } = require('./looper-agent')
+  const S = require('./looper-state')
+  const child = require('node:child_process').spawn('sleep', ['30'], { stdio: 'ignore' })
+  t.after(() => child.kill())
+  await new Promise(resolve => child.once('spawn', resolve))
+  const root = S.process_identity(process.pid)
+  // Simulate exit between the ps snapshot and the /proc read.
+  const identify = pid => pid === child.pid ? null : S.process_identity(pid)
+  const scan = alive => observe_descendants(process.pid, new Map(), root, { identify, alive })
+  assert.equal(scan(item => item.pid === child.pid ? false : S.process_alive(item)).some(row => row.pid === child.pid), false)
+  assert.throws(() => scan(item => item.pid === child.pid || S.process_alive(item)), error => error.unsettled === true)
+  assert.throws(() => scan(item => item.pid === child.pid ? 'unknown' : S.process_alive(item)), error => error.unsettled === true)
 })

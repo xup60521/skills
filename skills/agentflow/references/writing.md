@@ -1,61 +1,21 @@
-# Writing styles protocol
+# Clear answers and reports
 
-## Scope
+Apply to human-facing chat, questions, updates, Replies, reports and user documentation; preserve quotations, exact identifiers and fixed record formats. Prioritize comprehension. Machine-only prompts may be aggressively compressed while preserving requirements, exceptions, safeguards, precision and correctness; apply each rule to its intended reader in mixed documents. Render new human text, including template labels, under [use-lang](configuration.md#discovery-and-validation). Owner language/style instructions prevail; this guide changes neither authority nor answer destinations.
 
-- Apply by default to all human-readable prose and Markdown, including devlogs, trackers, designs, reports, guides, slides, specifications, operational logs, prompts, and skills. Where required, preserve an established stricter format, including report sections and numbered answers.
+**Ultimate comprehension:** Readers must understand the essential result without guessing or opening links. Use short paragraphs/items, one concept per block; dense blocks fail even when complete. Brevity, formatting and terminology must preserve meaning, necessary context, requirements, safeguards and decision-changing limits. Before delivery, check from the intended reader’s knowledge: can they explain the result, who does what, why it matters and any needed decision/action? Include applicable elements; rewrite until self-contained and unambiguous. This check grants no authority and requires no ritual, new document or owner confirmation.
 
-## Concise list style
+- **Lead with the answer:** Open reports with self-contained conclusions, key findings, applicable recommendations/decisions and material limits, before chronology, evidence or detail. State the conclusion/recommendation and needed action; place decision-changing limits beside it. Split required opening content into short blocks rather than cut it. No setup story or mandatory summary label. Explain unfamiliar choices’ behavior and significance before recommendations/questions. Postmortems/root-cause reports also open with root causes and prevention recommendations.
 
-- Prefer short bullets, each explaining one main point. Use sub-bullets only for distinct supporting points; keep closely related sentences together. Avoid prose-heavy blocks.
+- **Make scanning useful:** Order decisions/results, reasons, evidence, then optional procedure. Use prose for connected reasoning or lists for parallel/sequential points; neither is mandatory. Give each paragraph/item one concept, usually 1–3 short sentences; split at topic changes, never turn a dense paragraph into a long bullet. Lead each block with its main point and separate blocks with blank lines. Use headings for longer reports without ceremony. Multiple document references (e.g. Sources) use a label with nested `-` items, one source per blank-separated line.
 
-- Write for a high school student with no background in the topic. Use everyday words, explain necessary technical terms, and add a concrete example when it helps.
+- **Speak plainly:** Address educated decision-makers unfamiliar with the domain; respect their reasoning ability. Name concrete actions, benefits, causes and consequences rather than internal labels alone. Explain necessary jargon at first use in each independently read answer/report; remove unexplained abbreviations, vague qualifiers and compressed clause strings. Concision must remain understandable.
 
-- Be concise but complete: answer every requested question and preserve essential reasons and limitations. Omit repetition, unrelated background, and optional detail. Keep most bullets to one or two short sentences, but do not sacrifice clarity to meet a length target.
+- **Editor links:** Saved Markdown line links use `path#<line-number>`, never `path:<line-number>`; e.g. from `.agentflow/`: `Implemented [features.md](../skills/agentflow/references/features.md#31)`. Resolve paths relative to the document; retain named section anchors. Chat follows host link requirements; otherwise use `#<line-number>` with verified checkout-root-relative paths, or absolute paths if the host cannot resolve them. Never use report-relative `../` in chat. Wrap targets containing spaces in `<...>`.
 
-- Lead with the concrete result or action. Bold only short scan cues, never whole sentences. Number ordered steps, with necessary detail in nested bullets.
+- **Keep only useful detail:** Retain requirements, exceptions, safeguards and evidence needed to assess the answer. Link exact supporting records instead of repeating them. Keep workflow proof under [Round evidence](session.md#round-evidence), outside Reply unless explicitly requested; retain decision-changing limits in the answer. Put requested reproducible commands and specialist detail after the result; omit execution diaries and routine success summaries. Keep the essential explanation at the authorized answer destination so understanding requires no links.
 
-- Use everyday words (用口語、說人話). **NO COMPRESSED TECHNICAL TERMS OR EXPRESSIONS**, even to meet a length limit. Say what happened, what it means for the user, and what happens next. Explain each unavoidable technical term once, before use, without substituting another unfamiliar term. Include filenames and internal details only when readers need them.
+- **Keep claims honest:** Separate observed results, assessment and unavailable proof. Include request-relevant failures, limits and next actions. Never remove an authority/correctness condition for brevity.
 
-- Separate adjacent list items, including nested and numbered ones, with exactly one empty line, except in machine-serialized data, code, tables, exact quotations, and formats whose contract requires adjacent lines.
+- **Check before delivery:** Verify the opening gives the answer/action and paragraph/item starts expose the rest. Split long or multi-concept blocks without losing meaning or decision-changing limits. Can an unfamiliar reader explain what happens and why? Cut points that do not answer the request, affect the decision or support assessing it; link records instead of repeating them. Compare against the full request and surrounding rules for omissions/conflicts. Preserve required fields, notices, receipts and handoffs; style grants no authority.
 
-## Opening and reader action
-
-- Make the opening understandable on its own, without task IDs or linked files: the outcome, why it matters, any material problem or limitation, and any needed action or decision. Lead with a warning or decision when it changes the reader's next step; say no immediate action is needed only when that would otherwise be unclear.
-
-- Avoid activity lists, miniature reports, and repeating the same result. Group supporting detail around the reader's questions.
-
-## Evidence and status
-
-- Keep essential evidence beside its conclusion; put formulas, hashes, raw paths, process and scope accounting, repair history, and other lengthy technical detail after it or in links.
-
-- Distinguish tests running, requested behavior working, and task completion; separate earlier from current results. State uncertainty plainly. When shortening, keep material failures and limitations.
-
-- In findings and closing limits, separate trigger, impact, evidence, and action when distinct. Preserve exact verdict fields, severity, IDs, uncertainty, literal patch blocks, and final `Self-check:` boundaries.
-
-- Before delivery, check the opening against these rules and confirm the reader could explain the conclusion and next step in their own words. This check and all presentation choices are advisory, never automated completion gates, and never replace required content, evidence, or established formats.
-
-## Research reports
-
-- Write for an intelligent reader with no background in statistics, mathematics, or quantitative finance. Tie the opening to the owner's goal and recommend a next step.
-
-- For each important result, say what was tested, what it was compared with, what the number counts, and what conclusion it does and doesn't support. Give counts before percentages ("18 mistaken selections out of 500 trials"); add one concrete example when it helps. Never assign a probability the method doesn't justify.
-
-- Separate software failures, missing information, weak experiments, and evidence that a trading idea doesn't work. Say whether the user can continue, on what assumptions, what must be repaired, and how we'll know the repair worked.
-
-- Use connected prose where bullets would fragment the explanation.
-
-- In progress reports, state separately whether the software is built, whether experiments have run, what continues automatically after this turn, and what is waiting. Give calendar dates in the owner's timezone.
-
-## Document-specific formats
-
-- `show-diff`: follow SKILL.md's reasoned unified-diff format; standalone-report opening and supporting-section rules don't apply to the diff.
-
-- Agentflow devlogs: follow `references/closeout.md` for exact Reply structure and apply this style within Ask/RUN/WIP/Reply. A `[FINAL REPORT]` section is a devlog answer, not a standalone report.
-
-- Standalone reports and guides, plus worker reports and specifications even outside default scope: write for a human reader. After required identity and revision lines, open with a TL;DR, BLUF, or summary of two to four short bullets: result or decision, material risks or missing evidence, and next action or owner choice. Scale to the report; don't invent issues or actions to fill slots. Fit it within the stage's allowed headings; a short bold label needs no extra heading.
-
-- Requirements refreshes: leave the append-only question history unchanged; put the current overview only in the single replaceable `# Final requirements summary`.
-
-## Editing writing instructions
-
-- Before editing, record the exact requested improvement and the format obligations to preserve in the current task record. Check every deletion against its replacement and the owner's authorization; leave unrelated rules intact.
+- **Explain consequential choices:** Before asking for a consequential decision, including changes to accepted outcomes, guarantees or owner-chosen designs, explain the current/requested approach and each alternative: who does what, retained capabilities, changes/losses and effect on the owner’s goal. Explain consequences, any recommendation and its reason; separate independent choices from option-dependent questions. Name rule conflicts without silently changing the goal; distinguish tested behavior from assumptions/illustrations. Seek decisions on unresolved consequences, respect settled decisions/authority, and rewrite before asking if an unfamiliar reader cannot retell the work and consequence.

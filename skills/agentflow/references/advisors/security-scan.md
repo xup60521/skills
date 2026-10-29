@@ -1,26 +1,23 @@
 # Defensive security scan
 
-## Goal and scope
+Read-only examination of named changed files and affected trust/data boundaries. Trace relevant control/data flow for concrete authorization/ownership failures, injection, credential/private-data exposure, unsafe file/dependency handling or data loss. Inspect only implicated risks; name any newly implicated surface for host scope reconciliation before expanding.
 
-Perform one read-only advisory pass over the exact changed files and affected trust boundaries named by the controlling brief. Find concrete vulnerabilities and recommend action; do not edit, repair, or dispatch follow-up. Keep owner-visible behavior, evidence origin, and cosmetic record quality separate. Data-loss, destructive-behavior, credential-exposure, and central-requested-behavior-failure findings require owner/controller disposition; other findings are follow-up work.
+Each finding requires exact location, plausible trigger, impact, checked evidence and a scoped correction recommendation. Separate examined boundaries, checked-clean evidence and unexamined/unavailable proof; unavailable tools or refusal are not a clean scan. Do not repair, dispatch follow-ups or grant permission. The host resolves concrete in-scope defects under existing authority; new behavior or unrelated hardening remains a proposal. Security evidence supports, and does not replace, final acceptance.
 
-Read only declared inputs and do not ask the owner. If a new boundary is implicated, name the evidence and request bounded redispatch approval before examining it. Unavailable tools or unexamined surfaces are missing evidence, not clean results. Trust model/effort/timing/process/transport/content identity only from coordinator or host facts.
+## Select checks by affected risk
 
-## Review coverage
+- **SAST:** Inspect source/data flow with existing approved language/framework tooling. Trace untrusted input to SQL queries and other injection sinks; check parameter binding and safe handling of dynamic identifiers. A scanner count alone proves no safety.
 
-Check applicable declared surfaces for injection into interpreters; credentials/tokens/secrets and sensitive logs; authentication/authorization/ownership/object scoping; deserialization, prototype pollution, XSS, redirects, and file handling; dependency/install risk; CORS, cryptography, abuse limits, and verbose errors. Follow data/control flow only within declared boundaries. Validate every complete raw input form before aliases/defaults/precedence can discard evidence.
+- **Dependencies/secrets:** Treat vulnerable-dependency analysis and secret detection as separate checks; select only implicated coverage. Keep credentials redacted and record unavailable coverage.
 
-## Output contract
+- **Runtime:** Recommend targeted dynamic checks when source analysis cannot prove behavior. The host runs them only within existing authority; scanning live services, external sends or uploading source needs applicable authorization. No installation, repair or changed scanner configuration by this read-only advisor.
 
-- **Identity boundary:** Line one is exactly `* _YYYY-MM-DD HH:MM:SS ±HHMM (<Model>/<Effort>)_`, with fresh machine-local time and the brief's exact single-line model (1–128 characters) and effort (1–32).
-- **Final boundary:** Include exactly one Self-check: line as final content; a trailing newline is allowed. Any boundary violation fails.
+- **Financial/customer requirements:** Prioritize affected authorization/tenant boundaries, input-to-query paths, sensitive logs, secrets and transaction integrity. Required tools/blocking severities come from project rules or accepted contracts; do not invent gates or claim compliance.
 
-Write one Markdown report to the exact output path. State changed files, boundaries, revision, tools, commands, and examined surfaces. Each stable `SS-<n>` finding includes severity (`critical`, `high`, `medium`, or `low`), exact location, impact, evidence, and action. Include non-findings by vulnerability class, missing evidence, missed boundaries, and a conclusion; return the report path and a short factual summary.
+## Reproducible evidence
 
-## Invariants
+- For host-run tools, specify and inspect the evidence: exact source revision plus patch/hash, tool/version, ruleset/version/config, literal command and scanned scope/exclusions, exit status and result artifact. Prefer local analysis; source uploads require owner authority.
 
-- Review scope is exactly the declared files and trust boundaries.
-- Each finding has permitted severity, exact location, concrete impact, evidence, and action.
-- Non-findings name their checked class and surface; missing evidence stays separate.
-- New boundaries are reported for approval, not silently added.
-- No edit, repair loop, generic advice, numeric rating, or inferred clean result from unavailable evidence.
+- Separate confirmed findings, suspected findings and false positives with evidence/reasons; retain required unresolved findings. Explain tool failures and unexamined paths. Never treat an empty/failed scan as clean or suppress a finding to pass acceptance.
+
+- Combine tool output with boundary review and relevant authorized runtime proof. [OWASP guidance](https://community.owasp.org/Source_Code_Analysis_Tools) describes static analysis coverage and false-positive/access-control limits; no generic scan proves financial compliance.

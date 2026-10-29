@@ -1,41 +1,41 @@
-# Windows
+# Windows host guidance
 
-Read this before running Agentflow commands in native Windows PowerShell or cmd. Claude Code's Bash tool on Windows is Git Bash: use the POSIX forms in `SKILL.md` there unchanged.
+Use for Windows or explicit portability work. Adapt commands to the installed shell; preserve workflow guarantees. Documentation is not native execution proof.
 
-## Standard input without a heredoc
+- **Inspect first:** Verify CLI/Git versions, login availability without exposing credentials, shell, physical checkout/branch/worktrees and permissions. Never assume a macOS setup transfers.
 
-PowerShell has no heredoc. For `agf start --message-stdin`, `agf close --manifest-stdin`, and every `notebook-write.js … --input-stdin` command, pipe a single-quoted here-string after setting UTF-8 in both directions:
+- **Arguments/stdin:** Use literal argument arrays and UTF-8 input files/streams for external review; Bash heredocs require Git Bash, not PowerShell. Owner text stays data. Inspect installed help for exact controls; do not silently change provider/model/effort.
 
-```powershell
-$u = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = $u; [Console]::InputEncoding = $u; @'
-<exact owner message>
-'@ | node '<active-agentflow-skill-dir>\scripts\agf.js' start --repo '<repo>' --host <safe-id> --message-stdin --json
-```
+- **File ownership/writes:** Use exclusive creation, e.g. Node `wx` or .NET `FileMode.CreateNew`, not an existence check followed by overwrite. Read bytes; check unchanged source, write an adjacent temporary file and atomically replace only where supported. Sharing/ACL/rename failures stop that write; never clear foreign claims or weaken concurrency checks. [Microsoft FileMode](https://learn.microsoft.com/en-us/dotnet/api/system.io.filemode) documents CreateNew.
 
-- `@'` ends its line, and the closing `'@` starts a line with nothing before it. Everything between is literal: `$`, backticks and quotes are not interpreted.
+- **Path identity:** Resolve physical paths, drive/case aliases, junctions and short-name aliases before comparison. Reject escapes, collisions, reserved device names and unsupported paths; do not silently rename a configured notebook. Keep repository links/Git ignore patterns with `/`; receipts use observed physical paths and only the verified home-prefix abbreviation.
 
-- By default Windows PowerShell 5.1 sends non-ASCII text as `?`. Setting only `$OutputEncoding` adds a byte-order mark, which Agentflow drops.
+- **History/clock:** Preserve UTF-8 and original line-ending bytes; do not use PowerShell text rewrites or Git autocrlf conversions on history. Inspect actual culture/locale and clock/timezone; normalize locale tags under configuration, not from input language.
 
-- If a line of the message itself begins with `'@`, send the message through the host's own standard-input mechanism instead.
+## JavaScript looper
 
-- Stdin closes when the pipeline ends. Never create an input file.
+Use Node.js 20+ and Git for Windows. Copilot editing also requires [PowerShell 6+](https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli); its worker shell is separate from the trusted system Windows PowerShell used for process queries. Keep literal UTF-8 argv/stdin and `shell: false`; never repair a launch with `cmd /c`, shell interpolation or permission bypass. Native executables and explicit Node entrypoints are supported. Only verified standard npm Node shims may resolve to their script; custom/prefix-dependent batch or PowerShell wrappers require an explicit native executable or JS entrypoint. Example check: `["node", "C:/tools/npm/bin/npm-cli.js", "test"]`; use the actual inspected path, not this placeholder.
 
-## Commands and paths
+Keep configured and resolved command identity. Exclude the working directory from coordinator Windows executable lookup; verify the system process-query tool and bound queries. Signal only exact current process identities; Windows child creation must not predate the matched parent. Failed/unknown observations keep processes/claims unsettled, never stopped. Polling is not OS containment; detached children between observations and identity-to-signal races remain limits.
 
-- Quote paths in single quotes and double an embedded `'`. Windows PowerShell 5.1 has no `&&`; chain dependent commands as `first; if ($?) { second }`. Agentflow prints its suggested commands in this form on Windows.
+Send Copilot prompts through stdin to avoid Windows command-line limits; preserve complete bytes. Parse LF/CRLF headings without rewriting request/history or hashes. Refuse device names, alternate streams, trailing dots/spaces and reserved-directory/physical aliases; never silently rename them. Junction inspection is still required; Windows lacks the POSIX O_NOFOLLOW guarantee. Sharing/ACL/rename failures remain errors, not overwrite/cleanup permission.
 
-- Install the `agf` and `agf-looper` shortcuts with `node '<active-agentflow-skill-dir>\scripts\setup.js' --fix --profile $PROFILE`, and pass the same `--profile $PROFILE` to `agf uninstall`. Restart the shell afterwards.
+Before claiming native support, observe a disposable real Windows Node/Git/provider journey: literal args and long Unicode stdin, npm shim/explicit entrypoint, CRLF queue and ordinary checked integration, cancellation/descendants, unknown-query refusal with retained claims, crash/resume/competing claims, junction/device/ADS refusal and atomic replacement/ACL behavior. Report actual versions and every unavailable observation or symlink-privilege skip; Mac/static/branch tests prove no Windows execution. No provider/account/spending authority follows.
 
-- `export` and Unix utilities in other examples need a Unix shell. Run WSL examples entirely inside WSL with its own Node and Git.
+## Feature CLI
 
-## Workers and records
+The [terminal feature CLI](features.md#terminal-cli) uses Node >=20 and Git for Windows with literal argv, exact physical identities and byte-preserving records. Generate a PowerShell caller-cwd function using `node '<resolved-skill>/scripts/agf.js' shell powershell`; review it before authorized profile changes under [setup](setup.md#agf-command-setup). Ordinary output remains visible; only a successful validated destination file may change caller cwd. Existing bindings require an explicit upgrade request.
 
-- Workers start without a shell. A bare worker name resolves to a native `.exe` or `.com`, or to the program an npm `.cmd` wrapper runs. `AGF_OPEN` may name a `.cmd` editor such as `code`.
+Windows is best effort; native feature creation, conflict resolution, editor launch, profile/cwd and cleanup remain unproved without Windows execution. This fork never imports upstream's permanent-deletion exception. CLI feature/looper cleanup and owned markers move into the same-volume private `~/.agentflow-recovery` store with original-path metadata and identity checks, as described in [FORK.md](../FORK.md). This is recoverable storage, not a verified desktop Recycle Bin. Foreign claims, unknown results, unsafe paths and cross-volume moves still block cleanup.
 
-- Cancellation terminates the worker's whole process tree forcefully, because Windows has no graceful process-group signal.
+## Reversible cleanup
 
-- Nested-worker detection needs a POSIX process table. On Windows `nested_worker.visible` stays `false`; treat a worker run as unproven for nested-agent containment.
+- Follow owner deletion policy and [feature retirement](features.md#retire-one-worktree). Use `trash` or a verified platform Trash/Recycle Bin equivalent; permanent deletion is never a fallback.
 
-- `agf-looper` runs natively. Windows grants access through ACLs rather than POSIX permission bits, so its state directory relies on the user profile's ACL.
+- Before an alternative touches a checkout, prove it on a task-owned disposable directory on the same volume: explicitly recycle, locate the recoverable item, restore it and compare bytes. Record tool/API, volume and restoration evidence. If access, recoverability or identity is uncertain, leave the checkout/registration/branch intact and report the blocker.
 
-- Completion cleanup sends old records to the Recycle Bin, or to an installed `trash` command.
+- A small probe is insufficient: verify the actual target's volume/location, enabled bin and capacity for its contents, and require the selected operation to refuse permanent deletion if recycling is unavailable. Inspect its documented flags/failure behavior; reject permanent-delete warnings, automatic confirmations and uncertain guarantees before movement. [Microsoft shell flags](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-ifileoperation-setoperationflags) distinguish recycling, destruction warnings and automatic confirmation; a recycle request alone does not prove this refusal contract.
+
+- A Windows API candidate is `Microsoft.VisualBasic.FileIO.FileSystem.DeleteDirectory` with explicit `RecycleOption.SendToRecycleBin` and cancellation treated as failure. It defaults to permanent deletion; recycle/UI parameters are unsupported in noninteractive applications such as services. The candidate is not approved until the refusal/recovery contract above is proved. [Microsoft API documentation](https://learn.microsoft.com/en-us/dotnet/api/microsoft.visualbasic.fileio.filesystem.deletedirectory?view=net-10.0).
+
+- After authorized movement, verify the original path is absent **and** its contents are recoverable before unregistration/branch deletion. Ordinary marker removal follows owner policy too. Never edit the recycled checkout or claim native success from path absence.
