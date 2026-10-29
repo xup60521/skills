@@ -152,3 +152,9 @@ Streams: none.
 - Retired v8 machine-local hooks pointing at deleted scripts: .codex/hooks.json (Stop/UserPromptSubmit) and .git/hooks/pre-commit (devlog-guard), both moved to freedesktop Trash.
 - Independent review of the exact personal patch (c3140a8) found 4 confirmed and 4 plausible defects. Fixed with red-first tests: env links blocked clean cleanup/drop; cross-volume recovery failed after mutation (now refused before any change); orphan .trashinfo blocked retries; the exited-process rule could drop a live process; OpenCode result parsing too strict; OpenCode tasks could not read SKILL.md; tmpfs shell channel stack trace; duplicated docs text. Windows cross-drive refusal kept by policy and documented.
 - Full suite: 317 tests, 307 pass, 0 fail, 10 skips (native macOS Trash, zsh, platform-specific), twice consecutively. No live OpenCode provider or native Windows proof.
+
+## [RUN-005] Event — 2026-10-29 23:20:30 +0800 (A-002)
+
+- Owner approved push: origin/main d7fb89b..f16370e on xup60521/skills; nothing sent to agfnow.
+- Owner chose update + migrate for consumer projects. `bunx skills update -p -y` ran in the main checkouts of agentflow, political-talk-show, contextboard, lumifict and marketwise; all now install fork v9.1.0. Feature worktrees were left untouched by owner choice.
+- Retired verified v8 Stop/UserPromptSubmit units (Claude/Codex surfaces) and exact devlog-guard pre-commit hooks in those five projects; originals in ~/.aglite-backups/e41c74e8-fcd3-4636-a342-695ac054110a. contextboard's tracked Windows-path units were left for the other machine. Two lumifict v8 stream worktrees were repointed to their own pinned v8 skill copies. Config/STATUS conversion is left to each project's first v9 activation, where active v8 streams will block it as designed.
